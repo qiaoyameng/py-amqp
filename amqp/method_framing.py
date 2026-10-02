@@ -1,6 +1,7 @@
 """Convert between frames and higher-level AMQP methods."""
 # Copyright (C) 2007-2008 Barry Pederson <bp@barryp.org>
 
+import tempfile
 import threading
 from collections import defaultdict
 from struct import pack, pack_into, unpack_from
@@ -10,7 +11,10 @@ from .basic_message import Message
 from .exceptions import UnexpectedFrame
 from .utils import str_to_bytes
 
-__all__ = ('frame_handler', 'frame_writer')
+__all__ = (
+    'frame_handler', 'frame_writer',
+    'MemorySink', 'FileSink', 'FileBody', 'SpooledBodySink',
+)
 
 #: Set of methods that require both a content frame and a body frame.
 _CONTENT_METHODS = frozenset([
@@ -25,12 +29,151 @@ _CONTENT_METHODS = frozenset([
 #: and if it does not the message will fit into the preallocated buffer.
 FRAME_OVERHEAD = 40
 
+#: Default threshold above which :class:`SpooledBodySink` spools the
+#: message body to a temporary file instead of keeping it in memory.
+DEFAULT_BODY_SINK_THRESHOLD = 1024 * 1024
+
+
+class MemorySink:
+    """Body sink accumulating content frames in memory.
+
+    This is the default sink: the finished body is delivered as
+    :class:`bytes`, exactly like the historical behavior.
+    """
+
+    def __init__(self, body_size=0):
+        self.chunks = []
+
+    def write(self, chunk):
+        self.chunks.append(chunk)
+
+    def finish(self):
+        chunks, self.chunks = self.chunks, []
+        if not chunks:
+            return b''
+        if len(chunks) == 1:
+            return chunks[0]
+        return bytes().join(chunks)
+
+    def close(self):
+        self.chunks[:] = []
+
+
+class FileBody:
+    """Message body spooled to an anonymous temporary file.
+
+    Large inbound bodies are delivered as this object instead of
+    :class:`bytes`.  It provides a minimal file-like interface
+    (:meth:`read`/:meth:`close`, usable as a context manager); the
+    backing temporary file is anonymous, so no filesystem path is ever
+    exposed as the message body.
+
+    Ownership is transferred to the consumer on delivery: closing the
+    channel or connection will not close an already delivered body,
+    and the consumer is responsible for closing it.
+    """
+
+    __slots__ = ('_file',)
+
+    def __init__(self, fileobj):
+        self._file = fileobj
+
+    def read(self, size=-1):
+        if self._file is None:
+            raise ValueError('read from closed message body')
+        return self._file.read(size)
+
+    def close(self):
+        fileobj, self._file = self._file, None
+        if fileobj is not None:
+            fileobj.close()
+
+    @property
+    def closed(self):
+        return self._file is None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    def __repr__(self):
+        state = 'closed' if self.closed else 'open'
+        return f'<FileBody ({state}) at {id(self):#x}>'
+
+
+class FileSink:
+    """Body sink spooling content frames to a temporary file.
+
+    The finished body is delivered as a :class:`FileBody`.  The
+    temporary file is created with :func:`tempfile.TemporaryFile`, so
+    it has no visible path and is removed when closed.
+    """
+
+    def __init__(self, body_size=0, dir=None):
+        self._file = tempfile.TemporaryFile(dir=dir)
+
+    def write(self, chunk):
+        self._file.write(chunk)
+
+    def finish(self):
+        # Ownership of the file moves to the returned FileBody; this
+        # sink no longer refers to it, so closing the sink (or the
+        # connection) afterwards cannot invalidate the delivered body.
+        fileobj, self._file = self._file, None
+        fileobj.seek(0)
+        return FileBody(fileobj)
+
+    def close(self):
+        fileobj, self._file = self._file, None
+        if fileobj is not None:
+            fileobj.close()
+
+
+class SpooledBodySink:
+    """Factory selecting a body sink based on the declared body size.
+
+    Bodies whose header-declared size exceeds ``threshold`` bytes are
+    spooled to a temporary file (delivered as :class:`FileBody`);
+    smaller bodies are kept in memory and delivered as :class:`bytes`.
+
+    Pass an instance as the ``body_sink`` argument of
+    :class:`amqp.Connection`::
+
+        Connection(..., body_sink=SpooledBodySink(threshold=1024 * 1024))
+    """
+
+    def __init__(self, threshold=DEFAULT_BODY_SINK_THRESHOLD, dir=None):
+        self.threshold = threshold
+        self.dir = dir
+
+    def __call__(self, body_size):
+        if body_size is not None and body_size > self.threshold:
+            return FileSink(body_size, dir=self.dir)
+        return MemorySink(body_size)
+
 
 def frame_handler(connection, callback,
                   unpack_from=unpack_from, content_methods=_CONTENT_METHODS):
     """Create closure that reads frames."""
     expected_types = defaultdict(lambda: 1)
     partial_messages = {}
+    # Factory creating one body sink per inbound message; each channel
+    # being assembled gets its own sink instance.
+    sink_factory = getattr(connection, 'body_sink', None) or MemorySink
+
+    def discard_channel(channel):
+        """Drop any undelivered content for ``channel``.
+
+        Releases the body sink of a partially received message so that
+        temporary files are not leaked when a channel is closed or an
+        error occurs mid-assembly.
+        """
+        msg = partial_messages.pop(channel, None)
+        expected_types.pop(channel, None)
+        if msg is not None:
+            msg._discard_body()
 
     def on_frame(frame):
         frame_type, channel, buf = frame
@@ -55,12 +198,16 @@ def frame_handler(connection, callback,
 
         elif frame_type == 2:
             msg = partial_messages[channel]
-            msg.inbound_header(buf)
-
-            if not msg.ready:
-                # wait for the content-body
-                expected_types[channel] = 3
-                return False
+            try:
+                msg.inbound_header(buf)
+                if not msg.ready:
+                    # wait for the content-body
+                    expected_types[channel] = 3
+                    msg._body_sink = sink_factory(msg.body_size)
+                    return False
+            except Exception:
+                discard_channel(channel)
+                raise
 
             # bodyless message, we're done
             expected_types[channel] = 1
@@ -69,7 +216,11 @@ def frame_handler(connection, callback,
 
         elif frame_type == 3:
             msg = partial_messages[channel]
-            msg.inbound_body(buf)
+            try:
+                msg.inbound_body(buf)
+            except Exception:
+                discard_channel(channel)
+                raise
             if not msg.ready:
                 # wait for the rest of the content-body
                 return False
@@ -81,6 +232,13 @@ def frame_handler(connection, callback,
             return False
         return True
 
+    def close():
+        """Discard all undelivered content (connection teardown)."""
+        for channel in list(partial_messages):
+            discard_channel(channel)
+
+    on_frame.discard_channel = discard_channel
+    on_frame.close = close
     return on_frame
 
 

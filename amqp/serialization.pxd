@@ -36,6 +36,7 @@ cdef class GenericContent:
     cdef public object frame_args
     cdef public object body
     cdef list _pending_chunks
+    cdef public object _body_sink
     cdef public int body_received
     cdef public int body_size
     cdef public bint ready

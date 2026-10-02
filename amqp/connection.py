@@ -105,6 +105,14 @@ class Connection(AbstractChannel):
     When "confirm_publish" is set to True, the channel is put to
     confirm mode. In this mode, each published message is
     confirmed using Publisher confirms RabbitMQ extension.
+
+    The "body_sink" parameter is an optional callable receiving the
+    header-declared body size of each inbound message and returning a
+    sink object (with ``write``/``finish``/``close`` methods) used to
+    assemble the body.  Use
+    :class:`amqp.method_framing.SpooledBodySink` to spool bodies larger
+    than a threshold to temporary files; by default bodies are
+    assembled in memory and delivered as bytes.
     """
 
     Channel = Channel
@@ -197,7 +205,7 @@ class Connection(AbstractChannel):
                  on_unblocked=None, confirm_publish=False,
                  on_tune_ok=None, read_timeout=None, write_timeout=None,
                  socket_settings=None, frame_handler=frame_handler,
-                 frame_writer=frame_writer, **kwargs):
+                 frame_writer=frame_writer, body_sink=None, **kwargs):
         self._connection_id = uuid.uuid4().hex
         channel_max = channel_max or 65535
         frame_max = frame_max or 131072
@@ -241,6 +249,9 @@ class Connection(AbstractChannel):
 
         self.frame_handler_cls = frame_handler
         self.frame_writer_cls = frame_writer
+        #: Factory for inbound message body sinks, or None to assemble
+        #: bodies in memory (the default).
+        self.body_sink = body_sink
 
         self._handshake_complete = False
 
@@ -469,6 +480,14 @@ class Connection(AbstractChannel):
     def collect(self):
         if self._transport:
             self._transport.close()
+
+        # Release any partially received message content (e.g. bodies
+        # spooled to temporary files) that will never be delivered.
+        on_inbound_frame = self._on_inbound_frame
+        if on_inbound_frame is not None:
+            close = getattr(on_inbound_frame, 'close', None)
+            if close is not None:
+                close()
 
         if self.channels:
             # Copy all the channels except self since the channels

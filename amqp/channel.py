@@ -167,6 +167,14 @@ class Channel(AbstractChannel):
             except ValueError:
                 # channel id already removed
                 pass
+            # Release any partially received content for this channel
+            # that will never be delivered.
+            on_inbound_frame = getattr(
+                connection, '_on_inbound_frame', None)
+            discard_channel = getattr(
+                on_inbound_frame, 'discard_channel', None)
+            if discard_channel is not None:
+                discard_channel(channel_id)
         self.callbacks.clear()
         self.cancel_callbacks.clear()
         self.events.clear()

@@ -12,7 +12,7 @@ from decimal import Decimal
 from io import BytesIO
 from struct import pack, unpack_from
 
-from .exceptions import FrameSyntaxError
+from .exceptions import FrameError, FrameSyntaxError
 from .spec import Basic
 from .utils import bytes_to_str as pstr_t
 from .utils import str_to_bytes
@@ -489,6 +489,7 @@ class GenericContent:
 
         self.properties = props
         self._pending_chunks = []
+        self._body_sink = None
         self.body_received = 0
         self.body_size = 0
         self.ready = False
@@ -498,6 +499,7 @@ class GenericContent:
         "frame_args",
         "properties",
         "_pending_chunks",
+        "_body_sink",
         "body_received",
         "body_size",
         "ready",
@@ -573,9 +575,23 @@ class GenericContent:
         return offset
 
     def inbound_body(self, buf):
+        body_received = self.body_received + len(buf)
+        if body_received > self.body_size:
+            raise FrameError(
+                'Received more content body data than declared in the '
+                'content header: {} > {}'.format(
+                    body_received, self.body_size))
+        self.body_received = body_received
+        sink = self._body_sink
+        if sink is not None:
+            sink.write(buf)
+            if body_received >= self.body_size:
+                self._body_sink = None
+                self.body = sink.finish()
+                self.ready = True
+            return
         chunks = self._pending_chunks
-        self.body_received += len(buf)
-        if self.body_received >= self.body_size:
+        if body_received >= self.body_size:
             if chunks:
                 chunks.append(buf)
                 self.body = bytes().join(chunks)
@@ -585,3 +601,17 @@ class GenericContent:
             self.ready = True
         else:
             chunks.append(buf)
+
+    def _discard_body(self):
+        """Discard a partially received body, releasing its sink.
+
+        Called when the message will never be delivered (channel or
+        connection closed mid-assembly, or a framing error), so that
+        resources held by the body sink (e.g. temporary files) are
+        released.  Has no effect on an already delivered body.
+        """
+        sink = self._body_sink
+        if sink is not None:
+            self._body_sink = None
+            sink.close()
+        self._pending_chunks[:] = []

@@ -1,13 +1,16 @@
 import threading
-from struct import pack
+from struct import pack, unpack_from
 from unittest.mock import Mock
 
 import pytest
 
-from amqp import spec
+from amqp import Channel, Connection, spec
 from amqp.basic_message import Message
-from amqp.exceptions import UnexpectedFrame
-from amqp.method_framing import frame_handler, frame_writer
+from amqp.exceptions import FrameError, UnexpectedFrame
+from amqp.method_framing import (
+    FileBody, FileSink, MemorySink, SpooledBodySink, frame_handler,
+    frame_writer,
+)
 
 
 class test_frame_handler:
@@ -16,6 +19,7 @@ class test_frame_handler:
     def setup_conn(self):
         self.conn = Mock(name='connection')
         self.conn.bytes_recv = 0
+        self.conn.body_sink = None
         self.callback = Mock(name='callback')
         self.g = frame_handler(self.conn, self.callback)
 
@@ -207,3 +211,193 @@ class test_frame_writer:
         assert self.transport.write.call_count == 2
         assert b'A' * 40 in seen[0] and b'B' * 40 not in seen[0]
         assert b'B' * 40 in seen[1] and b'A' * 40 not in seen[1]
+
+
+class test_body_sinks:
+
+    def test_memory_sink_single_chunk(self):
+        sink = MemorySink(3)
+        sink.write(b'foo')
+        assert sink.finish() == b'foo'
+
+    def test_memory_sink_joins_chunks(self):
+        sink = MemorySink(6)
+        sink.write(b'foo')
+        sink.write(b'bar')
+        assert sink.finish() == b'foobar'
+
+    def test_file_sink_finish_transfers_ownership(self):
+        sink = FileSink(3)
+        sink.write(b'foo')
+        body = sink.finish()
+        assert isinstance(body, FileBody)
+        # closing the sink after delivery must not affect the body
+        sink.close()
+        assert not body.closed
+        assert body.read() == b'foo'
+        body.close()
+        assert body.closed
+
+    def test_file_sink_close_releases_file(self):
+        sink = FileSink(3)
+        sink.write(b'foo')
+        fileobj = sink._file
+        sink.close()
+        assert fileobj.closed
+        assert sink._file is None
+
+    def test_file_body_read_and_close(self):
+        sink = FileSink(6)
+        sink.write(b'foobar')
+        with sink.finish() as body:
+            assert body.read(3) == b'foo'
+            assert body.read() == b'bar'
+        assert body.closed
+        with pytest.raises(ValueError):
+            body.read()
+
+    def test_spooled_body_sink_threshold(self):
+        factory = SpooledBodySink(threshold=10)
+        assert isinstance(factory(10), MemorySink)
+        assert isinstance(factory(11), FileSink)
+
+
+def encode_frames(channel_id, msg, frame_max=64):
+    """Encode a content method into real AMQP frames with frame_writer."""
+    conn = Mock(name='write-connection')
+    conn.frame_max = frame_max
+    conn.bytes_sent = 0
+    transport = Mock(name='transport')
+    write = frame_writer(conn, transport)
+    write(1, channel_id, spec.Basic.Deliver, b'x', msg)
+    data = b''.join(
+        bytes(c.args[0]) for c in transport.write.call_args_list)
+    frames = []
+    offset = 0
+    while offset < len(data):
+        frame_type, frame_channel, frame_len = unpack_from(
+            '>BHI', data, offset)
+        payload = data[offset + 7:offset + 7 + frame_len]
+        assert data[offset + 7 + frame_len] == 0xce
+        frames.append((frame_type, frame_channel, payload))
+        offset += 8 + frame_len
+    return frames
+
+
+class test_frame_handler_body_sink:
+
+    @pytest.fixture(autouse=True)
+    def setup_conn(self):
+        self.sinks = []
+        spool = SpooledBodySink(threshold=16)
+
+        def factory(body_size):
+            sink = spool(body_size)
+            self.sinks.append(sink)
+            return sink
+
+        self.conn = Connection(body_sink=factory)
+        self.callback = Mock(name='callback')
+        self.conn._on_inbound_frame = frame_handler(
+            self.conn, self.callback)
+        self.g = self.conn._on_inbound_frame
+
+    def teardown_method(self):
+        if self.conn.channels is not None:
+            self.conn.collect()
+
+    def test_small_message_stays_bytes(self):
+        frames = encode_frames(1, Message(body=b'x' * 10))
+        for frame in frames:
+            self.g(frame)
+        msg = self.callback.call_args[0][3]
+        assert msg.body == b'x' * 10
+        assert isinstance(msg.body, bytes)
+
+    def test_large_message_spooled_to_file(self):
+        frames = encode_frames(1, Message(body=b'x' * 100))
+        for frame in frames:
+            self.g(frame)
+        msg = self.callback.call_args[0][3]
+        assert isinstance(msg.body, FileBody)
+        assert msg.body.read() == b'x' * 100
+        msg.body.close()
+
+    def test_interleaved_channels_and_channel_close(self):
+        body1 = b'A' * 100
+        body2 = b'B' * 120
+        frames1 = encode_frames(1, Message(body=body1))
+        frames2 = encode_frames(2, Message(body=body2))
+        # both messages are split into several body frames
+        assert [f[0] for f in frames1].count(3) > 1
+        assert [f[0] for f in frames2].count(3) > 1
+
+        ch1 = Channel(self.conn, 1)
+        Channel(self.conn, 2)
+
+        # interleave both messages, stopping before the last frame
+        # of the first message
+        self.g(frames1[0])
+        self.g(frames2[0])
+        self.g(frames1[1])
+        self.g(frames2[1])
+        for frame in frames1[2:-1]:
+            self.g(frame)
+        for frame in frames2[2:4]:
+            self.g(frame)
+        self.callback.assert_not_called()
+
+        # each channel accumulated into its own sink
+        assert len(self.sinks) == 2
+        sink1, sink2 = self.sinks
+        assert isinstance(sink1, FileSink)
+        assert isinstance(sink2, FileSink)
+
+        # closing channel 1 mid-message releases its partial content
+        ch1.collect()
+        assert sink1._file is None
+        self.callback.assert_not_called()
+
+        # the other message is still assembled correctly
+        for frame in frames2[4:]:
+            self.g(frame)
+        self.callback.assert_called_once()
+        channel_id, method_sig, _, msg = self.callback.call_args[0]
+        assert channel_id == 2
+        assert method_sig == spec.Basic.Deliver
+        assert isinstance(msg.body, FileBody)
+        assert msg.body.read() == body2
+
+        # the delivered body is owned by the consumer: tearing the
+        # connection down does not close it
+        self.conn.collect()
+        assert not msg.body.closed
+        msg.body.close()
+        assert msg.body.closed
+
+    def test_connection_close_releases_partial_content(self):
+        frames = encode_frames(1, Message(body=b'x' * 100))
+        for frame in frames[:-1]:
+            self.g(frame)
+        assert len(self.sinks) == 1
+        self.conn.collect()
+        assert self.sinks[0]._file is None
+        self.callback.assert_not_called()
+
+    def test_body_frame_exceeding_declared_size(self):
+        frames = encode_frames(1, Message(body=b'x' * 100))
+        self.g(frames[0])
+        self.g(frames[1])
+        assert len(self.sinks) == 1
+        with pytest.raises(FrameError):
+            # 101 bytes received for a 100 byte body
+            self.g((3, 1, b'x' * 101))
+        # the failed assembly released its sink and reset the channel
+        assert self.sinks[0]._file is None
+        self.callback.assert_not_called()
+        # the channel accepts a fresh message afterwards
+        frames = encode_frames(1, Message(body=b'y' * 10))
+        for frame in frames:
+            self.g(frame)
+        msg = self.callback.call_args[0][3]
+        assert msg.body == b'y' * 10
