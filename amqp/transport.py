@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from ssl import SSLError
 from struct import pack, unpack
 
-from .exceptions import UnexpectedFrame
+from .frame_decoder import FrameDecoder
 from .platform import KNOWN_TCP_OPTS, SOL_TCP
 from .utils import set_cloexec
 
@@ -91,6 +91,7 @@ class _AbstractTransport:
         self.sock = None
         self.raise_on_initial_eintr = raise_on_initial_eintr
         self._read_buffer = EMPTY_BUFFER
+        self._frame_decoder = FrameDecoder()
         self.host, self.port = to_host_port(host)
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
@@ -102,6 +103,7 @@ class _AbstractTransport:
         "sock",
         "raise_on_initial_eintr",
         "_read_buffer",
+        "_frame_decoder",
         "host",
         "port",
         "connect_timeout",
@@ -213,6 +215,9 @@ class _AbstractTransport:
 
         self._write(AMQP_PROTOCOL_HEADER)
 
+        # drop any frame state left over from a previous connection
+        self._frame_decoder.reset()
+
     def _get_tcp_socket_defaults(self, sock):
         tcp_opts = {}
         for opt in KNOWN_TCP_OPTS:
@@ -290,33 +295,24 @@ class _AbstractTransport:
             +------+---------+---------+   +-------------+   +-----------+
              octet    short     long        'size' octets        octet
 
+        The actual parsing is performed incrementally by
+        :class:`amqp.frame_decoder.FrameDecoder`; this method only feeds
+        it bytes read from the socket until a complete frame is decoded.
         """
-        read = self._read
-        read_frame_buffer = EMPTY_BUFFER
+        decoder = self._frame_decoder
         try:
-            frame_header = read(7, True)
-            read_frame_buffer += frame_header
-            frame_type, channel, size = unpack('>BHI', frame_header)
-            # >I is an unsigned int, but the argument to sock.recv is signed,
-            # so we know the size can be at most 2 * SIGNED_INT_MAX
-            if size > SIGNED_INT_MAX:
-                part1 = read(SIGNED_INT_MAX)
-
-                try:
-                    part2 = read(size - SIGNED_INT_MAX)
-                except (socket.timeout, OSError, SSLError):
-                    # In case this read times out, we need to make sure to not
-                    # lose part1 when we retry the read
-                    read_frame_buffer += part1
-                    raise
-
-                payload = b''.join([part1, part2])
-            else:
-                payload = read(size)
-            read_frame_buffer += payload
-            frame_end = ord(read(1))
+            while True:
+                frame = decoder.next_frame()
+                if frame is not None:
+                    return frame
+                # >I is an unsigned int, but the argument to sock.recv is
+                # signed, so a single read can be at most SIGNED_INT_MAX
+                chunk = self._read(
+                    min(decoder.expected_bytes, SIGNED_INT_MAX),
+                    decoder.expecting_header,
+                )
+                decoder.feed(chunk)
         except socket.timeout:
-            self._read_buffer = read_frame_buffer + self._read_buffer
             raise
         except (OSError, SSLError) as exc:
             if (
@@ -326,24 +322,16 @@ class _AbstractTransport:
                 # On windows we can get a read timeout with a winsock error
                 # code instead of a proper socket.timeout() error, see
                 # https://github.com/celery/py-amqp/issues/320
-                self._read_buffer = read_frame_buffer + self._read_buffer
                 raise socket.timeout()
 
             if isinstance(exc, SSLError) and 'timed out' in str(exc):
                 # Don't disconnect for ssl read time outs
                 # http://bugs.python.org/issue10272
-                self._read_buffer = read_frame_buffer + self._read_buffer
                 raise socket.timeout()
 
             if exc.errno not in _UNAVAIL:
                 self.connected = False
             raise
-        # frame-end octet must contain '\xce' value
-        if frame_end == 206:
-            return frame_type, channel, payload
-        else:
-            raise UnexpectedFrame(
-                f'Received frame_end {frame_end:#04x} while expecting 0xce')
 
     def write(self, s):
         try:

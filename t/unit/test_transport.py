@@ -10,7 +10,7 @@ from unittest.mock import ANY, MagicMock, Mock, call, patch, sentinel
 import pytest
 
 from amqp import transport
-from amqp.exceptions import UnexpectedFrame
+from amqp.exceptions import FrameError, UnexpectedFrame
 from amqp.transport import _AbstractTransport
 
 SIGNED_INT_MAX = 0x7FFFFFFF
@@ -363,12 +363,11 @@ class test_AbstractTransport:
 
     def test_read_frame__long(self):
         self.t._read = Mock()
-        self.t._read.side_effect = [pack('>BHI', 1, 1, SIGNED_INT_MAX + 16),
-                                    b'read1', b'read2', b'\xce']
-        frame_type, channel, payload = self.t.read_frame()
-        assert frame_type == 1
-        assert channel == 1
-        assert payload == b'read1read2'
+        self.t._read.side_effect = [pack('>BHI', 1, 1, SIGNED_INT_MAX + 16)]
+        # a declared payload size above the hard limit is rejected as soon
+        # as the frame header has been read
+        with pytest.raises(FrameError):
+            self.t.read_frame()
 
     def transport_read_EOF(self):
         for host, is_ssl in (('localhost:5672', False),
@@ -976,7 +975,10 @@ class test_TCPTransport:
         with pytest.raises(socket.timeout):
             self.t.read_frame()
 
-        assert len(self.t._read_buffer) == 7
+        # the partial frame header is kept in the incremental frame
+        # decoder instead of being pushed back into the read buffer
+        assert len(self.t._read_buffer) == 0
+        assert self.t._frame_decoder.buffered == 7
 
         frame_type, channel, payload = self.t.read_frame()
 

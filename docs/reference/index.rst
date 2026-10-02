@@ -16,6 +16,7 @@
     amqp.exceptions
     amqp.abstract_channel
     amqp.transport
+    amqp.frame_decoder
     amqp.method_framing
     amqp.platform
     amqp.protocol
