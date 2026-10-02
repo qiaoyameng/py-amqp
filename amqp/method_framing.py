@@ -10,7 +10,7 @@ from .basic_message import Message
 from .exceptions import UnexpectedFrame
 from .utils import str_to_bytes
 
-__all__ = ('frame_handler', 'frame_writer')
+__all__ = ('FrameHandler', 'frame_handler', 'frame_writer')
 
 #: Set of methods that require both a content frame and a body frame.
 _CONTENT_METHODS = frozenset([
@@ -26,14 +26,48 @@ _CONTENT_METHODS = frozenset([
 FRAME_OVERHEAD = 40
 
 
-def frame_handler(connection, callback,
-                  unpack_from=unpack_from, content_methods=_CONTENT_METHODS):
-    """Create closure that reads frames."""
-    expected_types = defaultdict(lambda: 1)
-    partial_messages = {}
+class FrameHandler:
+    """Process inbound frames, assembling content-bearing methods.
 
-    def on_frame(frame):
+    The handler is callable and processes one frame at a time; it
+    returns True when a complete method (with any content) was
+    delivered to the callback.
+
+    If ``body_sink_factory`` is given it is called as
+    ``factory(body_size, channel)`` when the content header of a
+    message arrives, and must return a body sink object (with
+    ``write``/``finalize``/``close`` methods, see
+    :mod:`amqp.body_sink`) or None to keep the default in-memory
+    behavior.  Each channel gets its own sink, so messages interleaved
+    on different channels are assembled independently.
+
+    Once a message is complete the sink is finalized and ownership of
+    the resulting body object (e.g. :class:`amqp.body_sink.FileBody`)
+    is transferred to the receiver of the message.  Undelivered
+    content is released by :meth:`discard` (single channel) and
+    :meth:`close` (all channels).
+    """
+
+    def __init__(self, connection, callback,
+                 unpack_from=unpack_from, content_methods=_CONTENT_METHODS,
+                 body_sink_factory=None):
+        self.connection = connection
+        self.callback = callback
+        self.unpack_from = unpack_from
+        self.content_methods = content_methods
+        self.body_sink_factory = body_sink_factory
+        self.expected_types = defaultdict(lambda: 1)
+        self.partial_messages = {}
+
+    def set_body_sink_factory(self, body_sink_factory):
+        """Set the factory used to create body sinks for new messages."""
+        self.body_sink_factory = body_sink_factory
+
+    def __call__(self, frame):
         frame_type, channel, buf = frame
+        connection = self.connection
+        expected_types = self.expected_types
+        partial_messages = self.partial_messages
         connection.bytes_recv += 1
         if frame_type not in (expected_types[channel], 8):
             raise UnexpectedFrame(
@@ -41,9 +75,9 @@ def frame_handler(connection, callback,
                     frame_type, expected_types[channel]),
             )
         elif frame_type == 1:
-            method_sig = unpack_from('>HH', buf, 0)
+            method_sig = self.unpack_from('>HH', buf, 0)
 
-            if method_sig in content_methods:
+            if method_sig in self.content_methods:
                 # Save what we've got so far and wait for the content-header
                 partial_messages[channel] = Message(
                     frame_method=method_sig, frame_args=buf,
@@ -51,13 +85,14 @@ def frame_handler(connection, callback,
                 expected_types[channel] = 2
                 return False
 
-            callback(channel, method_sig, buf, None)
+            self.callback(channel, method_sig, buf, None)
 
         elif frame_type == 2:
             msg = partial_messages[channel]
             msg.inbound_header(buf)
 
             if not msg.ready:
+                self._attach_body_sink(msg, channel)
                 # wait for the content-body
                 expected_types[channel] = 3
                 return False
@@ -65,23 +100,61 @@ def frame_handler(connection, callback,
             # bodyless message, we're done
             expected_types[channel] = 1
             partial_messages.pop(channel, None)
-            callback(channel, msg.frame_method, msg.frame_args, msg)
+            self.callback(channel, msg.frame_method, msg.frame_args, msg)
 
         elif frame_type == 3:
             msg = partial_messages[channel]
-            msg.inbound_body(buf)
+            try:
+                msg.inbound_body(buf)
+            except Exception:
+                # Assembly failed: release the undelivered content.
+                self.discard(channel)
+                raise
             if not msg.ready:
                 # wait for the rest of the content-body
                 return False
             expected_types[channel] = 1
             partial_messages.pop(channel, None)
-            callback(channel, msg.frame_method, msg.frame_args, msg)
+            self.callback(channel, msg.frame_method, msg.frame_args, msg)
         elif frame_type == 8:
             # bytes_recv already updated
             return False
         return True
 
-    return on_frame
+    def _attach_body_sink(self, msg, channel):
+        factory = self.body_sink_factory
+        if factory is not None and msg.body_sink is None:
+            sink = factory(msg.body_size, channel)
+            if sink is not None:
+                msg.body_sink = sink
+
+    def discard(self, channel):
+        """Discard a partially received message on ``channel``.
+
+        Releases any resources held by the undelivered content (e.g. a
+        temporary file backing the body sink).  Does nothing if no
+        message is being assembled on the channel.
+        """
+        msg = self.partial_messages.pop(channel, None)
+        self.expected_types.pop(channel, None)
+        if msg is not None:
+            msg.discard_body()
+
+    def close(self):
+        """Discard all partially received messages on every channel."""
+        for channel in list(self.partial_messages):
+            self.discard(channel)
+
+
+def frame_handler(connection, callback,
+                  unpack_from=unpack_from, content_methods=_CONTENT_METHODS,
+                  body_sink_factory=None):
+    """Create the inbound frame processor (see :class:`FrameHandler`)."""
+    return FrameHandler(
+        connection, callback,
+        unpack_from=unpack_from, content_methods=content_methods,
+        body_sink_factory=body_sink_factory,
+    )
 
 
 class Buffer:

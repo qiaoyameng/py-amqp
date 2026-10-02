@@ -167,6 +167,13 @@ class Channel(AbstractChannel):
             except ValueError:
                 # channel id already removed
                 pass
+            # Release any partially received message still being
+            # assembled for this channel (e.g. a body spooled to a
+            # temporary file).
+            on_inbound_frame = getattr(connection, '_on_inbound_frame', None)
+            discard = getattr(on_inbound_frame, 'discard', None)
+            if discard is not None:
+                discard(channel_id)
         self.callbacks.clear()
         self.cancel_callbacks.clear()
         self.events.clear()

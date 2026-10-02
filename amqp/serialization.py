@@ -12,7 +12,7 @@ from decimal import Decimal
 from io import BytesIO
 from struct import pack, unpack_from
 
-from .exceptions import FrameSyntaxError
+from .exceptions import FrameSyntaxError, UnexpectedFrame
 from .spec import Basic
 from .utils import bytes_to_str as pstr_t
 from .utils import str_to_bytes
@@ -483,12 +483,14 @@ class GenericContent:
     CLASS_ID = None
     PROPERTIES = [('dummy', 's')]
 
-    def __init__(self, frame_method=None, frame_args=None, **props):
+    def __init__(self, frame_method=None, frame_args=None, body_sink=None,
+                 **props):
         self.frame_method = frame_method
         self.frame_args = frame_args
 
         self.properties = props
         self._pending_chunks = []
+        self.body_sink = body_sink
         self.body_received = 0
         self.body_size = 0
         self.ready = False
@@ -498,6 +500,7 @@ class GenericContent:
         "frame_args",
         "properties",
         "_pending_chunks",
+        "body_sink",
         "body_received",
         "body_size",
         "ready",
@@ -573,9 +576,23 @@ class GenericContent:
         return offset
 
     def inbound_body(self, buf):
+        received = self.body_received + len(buf)
+        if received > self.body_size:
+            raise UnexpectedFrame(
+                'Received more content-body data ({0} bytes) than the '
+                '{1} bytes declared by the content header'.format(
+                    received, self.body_size))
+        self.body_received = received
+        sink = self.body_sink
+        if sink is not None:
+            sink.write(buf)
+            if received == self.body_size:
+                self.body_sink = None
+                self.body = sink.finalize()
+                self.ready = True
+            return
         chunks = self._pending_chunks
-        self.body_received += len(buf)
-        if self.body_received >= self.body_size:
+        if received == self.body_size:
             if chunks:
                 chunks.append(buf)
                 self.body = bytes().join(chunks)
@@ -585,3 +602,19 @@ class GenericContent:
             self.ready = True
         else:
             chunks.append(buf)
+
+    def discard_body(self):
+        """Release resources held by an incomplete inbound body.
+
+        Called when the message will never be delivered, e.g. because
+        assembly failed, or the channel/connection was closed while the
+        body was being received.  Closes the body sink (releasing any
+        temporary file) and drops buffered chunks.  Once a message is
+        complete, ownership of the body has been transferred to the
+        receiver and this method no longer touches it.
+        """
+        sink = self.body_sink
+        if sink is not None:
+            self.body_sink = None
+            sink.close()
+        self._pending_chunks[:] = []

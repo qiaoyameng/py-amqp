@@ -64,6 +64,10 @@ class test_Channel:
         assert not self.c.is_open
         self.c.collect()
 
+    def test_collect_discards_partial_message(self):
+        self.c.collect()
+        self.conn._on_inbound_frame.discard.assert_called_with(1)
+
     def test_do_revive(self):
         self.c.open = Mock(name='open')
         self.c.is_open = True

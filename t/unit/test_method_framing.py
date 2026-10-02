@@ -207,3 +207,155 @@ class test_frame_writer:
         assert self.transport.write.call_count == 2
         assert b'A' * 40 in seen[0] and b'B' * 40 not in seen[0]
         assert b'B' * 40 in seen[1] and b'A' * 40 not in seen[1]
+
+
+def encode_frames(frame_max, channel, method_sig, args, content):
+    """Encode a method with content into real wire frames."""
+    from struct import unpack_from
+
+    conn = Mock(name='connection')
+    conn.frame_max = frame_max
+    conn.bytes_sent = 0
+    transport = Mock(name='transport')
+    written = []
+    transport.write = lambda data: written.append(bytes(data))
+    writer = frame_writer(conn, transport)
+    writer(1, channel, method_sig, args, content)
+
+    frames = []
+    buf = b''.join(written)
+    offset = 0
+    while offset < len(buf):
+        ftype, fchannel, size = unpack_from('>BHI', buf, offset)
+        payload = buf[offset + 7:offset + 7 + size]
+        assert buf[offset + 7 + size] == 0xce
+        frames.append((ftype, fchannel, payload))
+        offset += 8 + size
+    return frames
+
+
+class test_frame_handler_body_sink:
+
+    @pytest.fixture(autouse=True)
+    def setup_conn(self):
+        from amqp.body_sink import spooled_body_sink
+
+        self.conn = Mock(name='connection')
+        self.conn.bytes_recv = 0
+        self.callback = Mock(name='callback')
+        self.sinks = {}
+        spool = spooled_body_sink(max_size=16)
+
+        def tracking_factory(body_size, channel):
+            sink = spool(body_size, channel)
+            self.sinks[channel] = sink
+            return sink
+
+        self.g = frame_handler(
+            self.conn, self.callback, body_sink_factory=tracking_factory)
+
+    def test_small_message_keeps_bytes_body(self):
+        frames = encode_frames(
+            512, 1, spec.Basic.Deliver, b'x' * 10,
+            Message(body=b'thequickbrownfox'))
+        for frame in frames[:-1]:
+            assert not self.g(frame)
+        assert self.g(frames[-1])
+        msg = self.callback.call_args[0][3]
+        assert type(msg.body) is bytes
+        assert msg.body == b'thequickbrownfox'
+
+    def test_large_message_spooled_to_file(self):
+        from amqp.body_sink import FileBody
+
+        body = b'y' * 40
+        frames = encode_frames(
+            24, 1, spec.Basic.Deliver, b'x' * 10, Message(body=body))
+        for frame in frames[:-1]:
+            assert not self.g(frame)
+        assert self.g(frames[-1])
+        msg = self.callback.call_args[0][3]
+        assert isinstance(msg.body, FileBody)
+        try:
+            assert msg.body.read() == body
+        finally:
+            msg.body.close()
+        assert msg.body.closed
+
+    def test_interleaved_messages_channel_close(self):
+        """Two interleaved messages; closing one channel mid-assembly
+        must release its half-finished body without affecting the
+        other channel's message."""
+        from amqp.body_sink import FileBody
+
+        body_a = b'A' * 40
+        body_b = b'B' * 40
+        frames_a = encode_frames(
+            24, 1, spec.Basic.Deliver, b'args-a', Message(body=body_a))
+        frames_b = encode_frames(
+            24, 2, spec.Basic.Deliver, b'args-b', Message(body=body_b))
+        # method + header + 3 body frames each
+        assert [f[0] for f in frames_a] == [1, 2, 3, 3, 3]
+        assert [f[0] for f in frames_b] == [1, 2, 3, 3, 3]
+
+        # interleave both messages up to (not including) their last frames
+        for frame_a, frame_b in zip(frames_a[:-1], frames_b[:-1]):
+            assert not self.g(frame_a)
+            assert not self.g(frame_b)
+        self.callback.assert_not_called()
+
+        # each channel has its own sink
+        sink_a = self.g.partial_messages[1].body_sink
+        sink_b = self.g.partial_messages[2].body_sink
+        assert sink_a is not sink_b
+        assert sink_a is self.sinks[1]
+        assert sink_b is self.sinks[2]
+        file_b = sink_b._file
+        assert not file_b.closed
+
+        # close channel 2 before its last frame arrives
+        self.g.discard(2)
+        assert 2 not in self.g.partial_messages
+        assert file_b.closed
+        assert sink_b._file is None
+
+        # the other message is still assembled correctly
+        assert self.g(frames_a[-1])
+        self.callback.assert_called_once()
+        channel, method_sig, _, msg = self.callback.call_args[0]
+        assert channel == 1
+        assert method_sig == spec.Basic.Deliver
+        assert isinstance(msg.body, FileBody)
+        with msg.body:
+            assert msg.body.read() == body_a
+
+    def test_body_frame_exceeding_declared_size(self):
+        """A body frame must not exceed the length declared by the
+        content header; the half-finished content is released."""
+        frames = encode_frames(
+            512, 1, spec.Basic.Deliver, b'x' * 10, Message(body=b'ab'))
+        assert not self.g(frames[0])  # method
+        assert not self.g(frames[1])  # header declares 2 bytes
+        sink = self.g.partial_messages[1].body_sink
+        with pytest.raises(UnexpectedFrame):
+            self.g((3, 1, b'thequickbrownfox'))
+        self.callback.assert_not_called()
+        assert 1 not in self.g.partial_messages
+        assert sink._file is None
+
+    def test_close_releases_all_partial_messages(self):
+        frames_a = encode_frames(
+            24, 1, spec.Basic.Deliver, b'args-a', Message(body=b'A' * 40))
+        frames_b = encode_frames(
+            24, 2, spec.Basic.Deliver, b'args-b', Message(body=b'B' * 40))
+        for frame in frames_a[:-1] + frames_b[:-1]:
+            self.g(frame)
+        file_a = self.g.partial_messages[1].body_sink._file
+        file_b = self.g.partial_messages[2].body_sink._file
+
+        self.g.close()
+
+        assert not self.g.partial_messages
+        assert file_a.closed
+        assert file_b.closed
+        self.callback.assert_not_called()

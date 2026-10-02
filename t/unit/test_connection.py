@@ -324,6 +324,21 @@ class test_Connection:
                 channel.collect.assert_called_with()
         assert self.conn._transport is None
 
+    def test_body_sink_factory_default(self):
+        assert Connection().body_sink_factory is None
+
+    def test_body_sink_factory_stored(self):
+        factory = Mock(name='body_sink_factory')
+        conn = Connection(body_sink_factory=factory)
+        assert conn.body_sink_factory is factory
+
+    def test_collect_closes_frame_handler(self):
+        handler = Mock(name='frame_handler')
+        self.conn._on_inbound_frame = handler
+        self.conn.collect()
+        handler.close.assert_called_with()
+        assert self.conn._on_inbound_frame is None
+
     def test_collect__transport_socket_raises_os_error(self):
         self.conn.transport = TCPTransport('localhost:5672')
         sock = self.conn.transport.sock = Mock(name='sock')

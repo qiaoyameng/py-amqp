@@ -197,7 +197,8 @@ class Connection(AbstractChannel):
                  on_unblocked=None, confirm_publish=False,
                  on_tune_ok=None, read_timeout=None, write_timeout=None,
                  socket_settings=None, frame_handler=frame_handler,
-                 frame_writer=frame_writer, **kwargs):
+                 frame_writer=frame_writer, body_sink_factory=None,
+                 **kwargs):
         self._connection_id = uuid.uuid4().hex
         channel_max = channel_max or 65535
         frame_max = frame_max or 131072
@@ -241,6 +242,7 @@ class Connection(AbstractChannel):
 
         self.frame_handler_cls = frame_handler
         self.frame_writer_cls = frame_writer
+        self.body_sink_factory = body_sink_factory
 
         self._handshake_complete = False
 
@@ -324,6 +326,11 @@ class Connection(AbstractChannel):
             self.transport.connect()
             self.on_inbound_frame = self.frame_handler_cls(
                 self, self.on_inbound_method)
+            if self.body_sink_factory is not None:
+                set_body_sink_factory = getattr(
+                    self.on_inbound_frame, 'set_body_sink_factory', None)
+                if set_body_sink_factory is not None:
+                    set_body_sink_factory(self.body_sink_factory)
             self.frame_writer = self.frame_writer_cls(self, self.transport)
 
             while not self._handshake_complete:
@@ -469,6 +476,14 @@ class Connection(AbstractChannel):
     def collect(self):
         if self._transport:
             self._transport.close()
+
+        if self._on_inbound_frame is not None:
+            # Release any undelivered content still being assembled
+            # (e.g. bodies spooled to temporary files).
+            close_handler = getattr(self._on_inbound_frame, 'close', None)
+            if close_handler is not None:
+                close_handler()
+            self._on_inbound_frame = None
 
         if self.channels:
             # Copy all the channels except self since the channels
