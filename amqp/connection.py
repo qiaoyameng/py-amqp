@@ -6,19 +6,24 @@ import socket
 import uuid
 import warnings
 from array import array
+from collections import deque
+from struct import pack
+from threading import Lock
 from time import monotonic
 
-from vine import ensure_promise
+from vine import ensure_promise, promise
 
 from . import __version__, sasl, spec
 from .abstract_channel import AbstractChannel
 from .channel import Channel
-from .exceptions import (AMQPDeprecationWarning, ChannelError, ConnectionError,
-                         ConnectionForced, MessageNacked, RecoverableChannelError,
+from .exceptions import (AMQPDeprecationWarning, Blocked, ChannelError,
+                         ConnectionError, ConnectionForced, MessageNacked,
+                         RecoverableChannelError,
                          RecoverableConnectionError, ResourceError,
                          error_for_code)
 from .method_framing import frame_handler, frame_writer
 from .transport import Transport
+from .utils import str_to_bytes
 
 try:
     from ssl import SSLError
@@ -58,6 +63,221 @@ NEGOTIATE_CAPABILITIES = {
     'connection.blocked': True,
     'authentication_failure_close': True,
 }
+
+
+class _QueuedContent:
+    def __init__(self, body, properties):
+        if isinstance(body, str):
+            body = body.encode(
+                properties.setdefault('content_encoding', 'utf-8')
+            )
+        else:
+            body = bytes(body)
+        self.body = body
+        self.properties = dict(properties)
+
+    def _serialize_properties(self):
+        from .basic_message import Message
+        message = Message(body=self.body, **self.properties)
+        return message._serialize_properties()
+
+
+class _QueuedPublish:
+    def __init__(self, channel_id, frames, promise):
+        self.channel_id = channel_id
+        self.frames = frames
+        self.promise = promise
+        self.sent_frames = 0
+        self.size = sum(len(frame) for frame in frames)
+
+
+def _encode_publish_frames(channel_id, method_sig, args, content, frame_max):
+    frames = []
+    args = str_to_bytes(args)
+    method_frame = b''.join([pack('>HH', *method_sig), args])
+    frames.append(pack(
+        '>BHI%dsB' % len(method_frame),
+        1, channel_id, len(method_frame), method_frame, 0xce,
+    ))
+    if content is None:
+        return frames
+
+    properties = content._serialize_properties()
+    header_frame = b''.join([
+        pack('>HHQ', method_sig[0], 0, len(content.body)),
+        properties,
+    ])
+    frames.append(pack(
+        '>BHI%dsB' % len(header_frame),
+        2, channel_id, len(header_frame), header_frame, 0xce,
+    ))
+    chunk_size = max(frame_max - 8, 1)
+    for offset in range(0, len(content.body), chunk_size):
+        body_frame = content.body[offset:offset + chunk_size]
+        frames.append(pack(
+            '>BHI%dsB' % len(body_frame),
+            3, channel_id, len(body_frame), body_frame, 0xce,
+        ))
+    return frames
+
+
+class _PublishGate:
+    def __init__(self, policy='reject', max_bytes=None, frame_max=131072):
+        self.policy = policy
+        self.max_bytes = None if max_bytes is None else int(max_bytes)
+        self.frame_max = frame_max
+        self.blocked = False
+        self.draining = False
+        self.buffered_bytes = 0
+        self.queue = deque()
+        self._writer = None
+        self._write_frame = None
+        self._lock = Lock()
+
+    def bind(self, writer, write_frame, on_publish_written=None):
+        self._writer = writer
+        self._write_frame = write_frame
+        self._on_publish_written = on_publish_written
+
+    def block(self):
+        with self._lock:
+            self.blocked = True
+
+    def reset(self):
+        with self._lock:
+            pending = list(self.queue)
+            self.queue.clear()
+            self.buffered_bytes = 0
+            self.blocked = False
+            self.draining = False
+        for item in pending:
+            item.promise.throw(Blocked('connection closed'), propagate=False)
+
+    def write(self, type_, channel_id, method_sig, args, content):
+        result = None
+        with self._lock:
+            direct_write = (
+                type_ != 1 or method_sig != spec.Basic.Publish or
+                (not self.blocked and not self.draining)
+            )
+            if not direct_write:
+                if self.policy != 'queue':
+                    raise Blocked('connection blocked')
+
+                promise_to_fulfill = promise()
+                queued_content = _QueuedContent(
+                    content.body, content.properties,
+                )
+                frames = _encode_publish_frames(
+                    channel_id, method_sig, args,
+                    queued_content, self.frame_max,
+                )
+                queued = _QueuedPublish(
+                    channel_id, frames, promise_to_fulfill,
+                )
+                if self.max_bytes is not None and (
+                    self.buffered_bytes + queued.size > self.max_bytes
+                ):
+                    raise Blocked(
+                        'connection blocked: publish buffer full'
+                    )
+
+                self.queue.append(queued)
+                self.buffered_bytes += queued.size
+                result = promise_to_fulfill
+            else:
+                result = None
+
+        if result is not None:
+            return result
+        self._writer(type_, channel_id, method_sig, args, content)
+
+    def unblocked(self, frame_max):
+        with self._lock:
+            if self.draining:
+                return
+            self.blocked = False
+            self.draining = True
+            flushing = self.queue
+            self.queue = deque()
+
+        requeued = False
+        try:
+            while flushing and not self.blocked:
+                item = flushing.popleft()
+                while item.sent_frames < len(item.frames):
+                    if self.blocked:
+                        remaining = deque([item])
+                        remaining.extend(flushing)
+                        with self._lock:
+                            queued = self.queue
+                            self.queue = remaining
+                            self.queue.extend(queued)
+                        self.buffered_bytes = sum(
+                            queued_item.size
+                            for queued_item in self.queue
+                        )
+                        requeued = True
+                        return
+                    self._write_frame(item.frames[item.sent_frames])
+                    item.sent_frames += 1
+                if self.blocked:
+                    remaining = deque([item])
+                    remaining.extend(flushing)
+                    with self._lock:
+                        queued = self.queue
+                        self.queue = remaining
+                        self.queue.extend(queued)
+                        self.buffered_bytes = sum(
+                            queued_item.size
+                            for queued_item in self.queue
+                        )
+                    requeued = True
+                    return
+                item.promise()
+                if self._on_publish_written is not None:
+                    self._on_publish_written()
+                if not flushing:
+                    with self._lock:
+                        if self.queue:
+                            flushing = self.queue
+                            self.queue = deque()
+        except BaseException:
+            self.blocked = True
+            raise
+        finally:
+            with self._lock:
+                if not requeued and flushing:
+                    remaining = deque(flushing)
+                    remaining.extend(self.queue)
+                    self.queue = remaining
+                self.buffered_bytes = sum(
+                    item.size for item in self.queue
+                )
+                self.draining = False
+
+    def fail_pending(self, exc):
+        with self._lock:
+            self.blocked = True
+            pending = list(self.queue)
+            self.queue.clear()
+            self.buffered_bytes = 0
+        for item in pending:
+            item.promise.throw(exc, propagate=False)
+
+    def fail_channel(self, channel_id, exc):
+        with self._lock:
+            failed = deque()
+            pending = list(self.queue)
+            self.queue.clear()
+            self.buffered_bytes = 0
+            for item in pending:
+                if item.channel_id == channel_id:
+                    item.promise.throw(exc, propagate=False)
+                else:
+                    failed.append(item)
+            self.queue = failed
+            self.buffered_bytes = sum(item.size for item in failed)
 
 
 class Connection(AbstractChannel):
@@ -105,9 +325,22 @@ class Connection(AbstractChannel):
     When "confirm_publish" is set to True, the channel is put to
     confirm mode. In this mode, each published message is
     confirmed using Publisher confirms RabbitMQ extension.
+
+    When the broker sends ``connection.blocked``,
+    ``blocked_publish_policy='reject'`` rejects new publishes with
+    :class:`~amqp.exceptions.Blocked`. Use
+    ``blocked_publish_policy='queue'`` with
+    ``blocked_publish_buffer_size`` to buffer publishes up to that many
+    wire bytes. Heartbeats, acknowledgements, close frames, and other
+    control methods continue while publishes are blocked. Buffered
+    publishes are sent in connection FIFO order on
+    ``connection.unblocked`` and are explicitly failed if the connection
+    closes before they can be written.
     """
 
     Channel = Channel
+    BLOCKED_PUBLISH_REJECT = 'reject'
+    BLOCKED_PUBLISH_QUEUE = 'queue'
 
     #: Mapping of protocol extensions to enable.
     #: The server will report these in server_properties[capabilities],
@@ -195,6 +428,8 @@ class Connection(AbstractChannel):
                  ssl=False, connect_timeout=None, channel_max=None,
                  frame_max=None, heartbeat=0, on_open=None, on_blocked=None,
                  on_unblocked=None, confirm_publish=False,
+                 blocked_publish_policy=None,
+                 blocked_publish_buffer_size=None,
                  on_tune_ok=None, read_timeout=None, write_timeout=None,
                  socket_settings=None, frame_handler=frame_handler,
                  frame_writer=frame_writer, **kwargs):
@@ -258,6 +493,20 @@ class Connection(AbstractChannel):
         self.client_heartbeat = heartbeat
 
         self.confirm_publish = confirm_publish
+        if blocked_publish_policy is None:
+            blocked_publish_policy = 'reject'
+        if blocked_publish_policy not in ('reject', 'queue'):
+            raise ValueError(
+                "blocked_publish_policy must be 'reject' or 'queue'"
+            )
+        if blocked_publish_buffer_size is not None:
+            blocked_publish_buffer_size = int(blocked_publish_buffer_size)
+            if blocked_publish_buffer_size < 0:
+                raise ValueError(
+                    'blocked_publish_buffer_size must not be negative'
+                )
+        self.blocked_publish_policy = blocked_publish_policy
+        self.blocked_publish_buffer_size = blocked_publish_buffer_size
         self.ssl = ssl
         self.read_timeout = read_timeout
         self.write_timeout = write_timeout
@@ -267,6 +516,9 @@ class Connection(AbstractChannel):
         self.on_blocked = on_blocked
         self.on_unblocked = on_unblocked
         self.on_open = ensure_promise(on_open)
+        self._publish_gate = _PublishGate(
+            blocked_publish_policy, blocked_publish_buffer_size, frame_max,
+        )
 
         self._used_channel_ids = array('H')
 
@@ -324,7 +576,13 @@ class Connection(AbstractChannel):
             self.transport.connect()
             self.on_inbound_frame = self.frame_handler_cls(
                 self, self.on_inbound_method)
-            self.frame_writer = self.frame_writer_cls(self, self.transport)
+            raw_frame_writer = self.frame_writer_cls(self, self.transport)
+            self._publish_gate.reset()
+            self._publish_gate.bind(
+                raw_frame_writer, self.transport.write,
+                self._record_queued_publish_written,
+            )
+            self._frame_writer = self._publish_gate.write
 
             while not self._handshake_complete:
                 self.drain_events(timeout=self.connect_timeout)
@@ -426,6 +684,7 @@ class Connection(AbstractChannel):
         client_heartbeat = self.client_heartbeat or 0
         self.channel_max = channel_max or self.channel_max
         self.frame_max = frame_max or self.frame_max
+        self._publish_gate.frame_max = self.frame_max
         self.server_heartbeat = server_heartbeat or 0
 
         # negotiate the heartbeat interval to the smaller of the
@@ -467,6 +726,9 @@ class Connection(AbstractChannel):
         return self._transport and self._transport.connected
 
     def collect(self):
+        self._publish_gate.fail_pending(
+            Blocked('connection closed: pending publish failed')
+        )
         if self._transport:
             self._transport.close()
 
@@ -597,6 +859,9 @@ class Connection(AbstractChannel):
             # already closed
             return
 
+        self._publish_gate.fail_pending(
+            Blocked('connection closed: pending publish failed')
+        )
         try:
             self.is_closing = True
             return self.send_method(
@@ -664,6 +929,9 @@ class Connection(AbstractChannel):
                 When the close is provoked by a method exception, this
                 is the ID of the method.
         """
+        self._publish_gate.fail_pending(
+            Blocked('connection closed: pending publish failed')
+        )
         self._x_close_ok()
         raise error_for_code(reply_code, reply_text,
                              (class_id, method_id), ConnectionError)
@@ -701,16 +969,21 @@ class Connection(AbstractChannel):
         Notes:
             This is an RabbitMQ Extension.
         """
+        self._publish_gate.block()
         reason = 'connection blocked, see broker logs'
         if self.on_blocked:
             return self.on_blocked(reason)
 
     def _on_unblocked(self):
+        self._publish_gate.unblocked(self.frame_max)
         if self.on_unblocked:
             return self.on_unblocked()
 
     def send_heartbeat(self):
         self.frame_writer(8, 0, None, None, None)
+
+    def _record_queued_publish_written(self):
+        self.bytes_sent += 1
 
     def heartbeat_tick(self, rate=2):
         """Send heartbeat packets if necessary.

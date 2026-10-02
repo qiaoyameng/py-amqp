@@ -15,6 +15,7 @@ __all__ = (
     'NotAllowed', 'AMQPNotImplementedError', 'InternalError',
     'MessageNacked',
     'AMQPDeprecationWarning',
+    'Blocked',
 )
 
 

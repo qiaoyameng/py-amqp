@@ -37,7 +37,7 @@ from .exceptions import (AccessRefused, AMQPError,  # noqa
                          IrrecoverableChannelError,
                          IrrecoverableConnectionError, NoConsumers, NotAllowed,
                          NotFound, PreconditionFailed, RecoverableChannelError,
-                         RecoverableConnectionError, ResourceError,
+                         RecoverableConnectionError, ResourceError, Blocked,
                          ResourceLocked, UnexpectedFrame, error_for_code)
 from .utils import promise  # noqa
 
@@ -68,6 +68,7 @@ __all__ = (
     'ChannelNotOpen',
     'UnexpectedFrame',
     'ResourceError',
+    'Blocked',
     'NotAllowed',
     'AMQPNotImplementedError',
     'InternalError',

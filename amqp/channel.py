@@ -10,8 +10,8 @@ from vine import ensure_promise
 
 from . import spec
 from .abstract_channel import AbstractChannel
-from .exceptions import (ChannelError, ConsumerCancelled, MessageNacked,
-                         RecoverableConnectionError,
+from .exceptions import (Blocked, ChannelError, ConsumerCancelled,
+                         MessageNacked, RecoverableConnectionError,
                          error_for_code)
 from .protocol import queue_declare_ok_t
 
@@ -161,6 +161,15 @@ class Channel(AbstractChannel):
         channel_id, self.channel_id = self.channel_id, None
         connection, self.connection = self.connection, None
         if connection:
+            publish_gate = getattr(connection, '_publish_gate', None)
+            if publish_gate is not None:
+                publish_gate.fail_channel(
+                    channel_id,
+                    Blocked(
+                        f'channel {channel_id} closed: '
+                        'pending publish failed'
+                    )
+                )
             connection.channels.pop(channel_id, None)
             try:
                 connection._used_channel_ids.remove(channel_id)
@@ -1818,6 +1827,11 @@ class Channel(AbstractChannel):
             self._confirm_selected = True
             self.confirm_select()
         ret = self._basic_publish(*args, **kwargs)
+        if (
+            getattr(ret, 'failed', False)
+            and isinstance(ret.reason, BaseException)
+        ):
+            raise ret.reason
         # Waiting for confirmation of message.
         timeout = confirm_timeout or kwargs.get('timeout', None)
         self.wait([spec.Basic.Ack, spec.Basic.Nack],

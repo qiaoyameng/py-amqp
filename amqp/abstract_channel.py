@@ -67,9 +67,21 @@ class AbstractChannel:
             raise RecoverableConnectionError('connection already closed')
         args = dumps(format, args) if format else ''
         try:
-            conn.frame_writer(1, self.channel_id, sig, args, content)
+            write_result = conn.frame_writer(
+                1, self.channel_id, sig, args, content,
+            )
         except StopIteration:
             raise RecoverableConnectionError('connection already closed')
+
+        if isinstance(write_result, promise):
+            if callback:
+                write_result.then(callback)
+            if wait:
+                return self.wait(
+                    wait, returns_tuple=returns_tuple,
+                    callback=write_result,
+                )
+            return write_result
 
         # TODO temp: callback should be after write_method ... ;)
         if callback:
@@ -96,6 +108,8 @@ class AbstractChannel:
 
         try:
             while not p.ready:
+                if p.failed and isinstance(p.reason, BaseException):
+                    raise p.reason
                 conn = self.connection
                 if conn is None:
                     raise RecoverableConnectionError('connection already closed')

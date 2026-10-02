@@ -11,9 +11,23 @@ from amqp.connection import SSLError
 from amqp.exceptions import (ConnectionError, NotFound,
                              RecoverableConnectionError, ResourceError)
 from amqp.sasl import AMQPLAIN, EXTERNAL, GSSAPI, PLAIN, SASL
+from amqp.serialization import dumps
 from amqp.transport import TCPTransport
 
 from t.mocks import ContextMock
+
+
+
+def parse_frame(frame):
+    frame_type = frame[0]
+    channel = int.from_bytes(frame[1:3], 'big')
+    method_sig = None
+    if frame_type == 8:
+        return 8, channel, None
+    if frame_type == 1 and len(frame) >= 13:
+        method_sig = (int.from_bytes(frame[7:9], 'big'),
+                      int.from_bytes(frame[9:11], 'big'))
+    return frame_type, channel, method_sig
 
 
 class test_Connection:
@@ -37,6 +51,19 @@ class test_Connection:
         authentication = SASL()
         self.conn = Connection(authentication=authentication)
         assert self.conn.authentication == (authentication,)
+
+    def test_blocked_publish_policy_defaults_and_budget(self):
+        conn = Connection(authentication=AMQPLAIN('foo', 'bar'))
+        assert conn.blocked_publish_policy == 'reject'
+        assert conn.blocked_publish_buffer_size is None
+
+        conn = Connection(
+            authentication=AMQPLAIN('foo', 'bar'),
+            blocked_publish_policy='queue',
+            blocked_publish_buffer_size=4096,
+        )
+        assert conn.blocked_publish_policy == 'queue'
+        assert conn.blocked_publish_buffer_size == 4096
 
     def test_sasl_authentication_iterable(self):
         authentication = SASL()
@@ -580,4 +607,298 @@ class test_Connection:
                 repr(c.transport)
             ),
             repr(c)
+        )
+
+    def test_blocked_publish_rejects_and_allows_control_frames(self):
+        from struct import pack as struct_pack
+
+        from amqp.exceptions import Blocked
+        from amqp.method_framing import frame_handler, frame_writer
+        from amqp.basic_message import Message
+        from amqp.channel import Channel
+
+        written = []
+        transport = Mock(name='transport')
+        transport.write.side_effect = lambda data: written.append(bytes(data))
+        transport.having_timeout = ContextMock()
+        conn = Connection(
+            authentication=AMQPLAIN('foo', 'bar'),
+            blocked_publish_policy='reject',
+        )
+        conn.transport = transport
+        conn.on_inbound_frame = frame_handler(
+            conn, conn.on_inbound_method
+        )
+        conn._frame_writer = frame_writer(conn, transport)
+        conn._publish_gate.bind(
+            conn._frame_writer, transport.write, None,
+        )
+        conn._frame_writer = conn._publish_gate.write
+        conn._on_blocked()
+
+        channel = Channel(conn, 1)
+        with pytest.raises(Blocked):
+            channel._basic_publish(Message(b'queued'), 'exchange', 'key')
+
+        conn._frame_writer(8, 0, None, None, None)
+        ack_payload = struct_pack('>Q?', 7, False)
+        ack_frame = (
+            b'\x01\x00\x01'
+            + (9).to_bytes(4, 'big')
+            + spec.Basic.Ack[0].to_bytes(2, 'big')
+            + spec.Basic.Ack[1].to_bytes(2, 'big')
+            + ack_payload
+            + b'\xce'
+        )
+        ack_callback = Mock(name='ack_callback')
+        channel.events['basic_ack'].add(ack_callback)
+        conn.on_inbound_frame(
+            (1, 1, ack_frame[7:-1])
+        )
+        ack_callback.assert_called_once_with(7, False)
+        assert not conn.on_inbound_frame(
+            (8, 0, b'')
+        )
+        channel.basic_ack(7)
+        conn._frame_writer(
+            1, 0, spec.Connection.Close,
+            dumps('BsBB', (0, '', 0, 0)), None,
+        )
+
+        published = [
+            frame for frame in written
+            if parse_frame(frame)[2] == spec.Basic.Publish
+        ]
+        assert not published
+        assert any(parse_frame(frame)[0] == 8 for frame in written)
+        assert any(
+            parse_frame(frame)[:2] == (1, 1)
+            and parse_frame(frame)[2] == spec.Basic.Ack
+            for frame in written
+        )
+        assert any(
+            parse_frame(frame)[2] == spec.Connection.Close
+            for frame in written
+        )
+
+    def test_blocked_publish_queue_flush_and_reblocks(self):
+        from amqp.exceptions import Blocked
+        from amqp.method_framing import frame_writer
+        from amqp.basic_message import Message
+        from amqp.channel import Channel
+
+        written = []
+        transport = Mock(name='transport')
+        transport.write.side_effect = lambda data: written.append(bytes(data))
+        transport.having_timeout = ContextMock()
+        conn = Connection(
+            authentication=AMQPLAIN('foo', 'bar'),
+            blocked_publish_policy='queue',
+            blocked_publish_buffer_size=100000,
+        )
+        conn.transport = transport
+        conn._frame_writer = frame_writer(conn, transport)
+        conn._publish_gate.bind(
+            conn._frame_writer, transport.write, None,
+        )
+        conn._frame_writer = conn._publish_gate.write
+        conn._on_blocked()
+
+        first = Channel(conn, 1)
+        second = Channel(conn, 2)
+        first._basic_publish(Message(b'first'), '', 'one')
+        second._basic_publish(Message(b'second'), '', 'two')
+        first._basic_publish(Message(b'third'), '', 'three')
+        assert not written
+
+        block_after_method_frame = False
+
+        def reblock_after_first(data):
+            nonlocal block_after_method_frame
+            written.append(bytes(data))
+            if parse_frame(data)[2] == spec.Basic.Publish:
+                block_after_method_frame = True
+            elif block_after_method_frame:
+                conn._on_blocked()
+
+        transport.write.side_effect = reblock_after_first
+        conn._on_unblocked()
+
+        published_channels = [
+            parse_frame(frame)[1] for frame in written
+            if (
+                parse_frame(frame)[0] == 1
+                and parse_frame(frame)[2] == spec.Basic.Publish
+            )
+        ]
+        assert published_channels == [1]
+        assert len(conn._publish_gate.queue) == 3
+        assert conn._publish_gate.queue[0].sent_frames == 2
+        assert [parse_frame(frame)[0] for frame in written] == [1, 2]
+
+        transport.write.side_effect = lambda data: written.append(bytes(data))
+        conn._on_unblocked()
+        published_channels = [
+            parse_frame(frame)[1] for frame in written
+            if (
+                parse_frame(frame)[0] == 1
+                and parse_frame(frame)[2] == spec.Basic.Publish
+            )
+        ]
+        assert published_channels == [1, 2, 1]
+        assert not conn._publish_gate.queue
+
+    def test_blocked_publish_queue_resumes_large_body_frames(self):
+        from amqp.method_framing import frame_writer
+        from amqp.basic_message import Message
+        from amqp.channel import Channel
+
+        written = []
+        transport = Mock(name='transport')
+        transport.write.side_effect = lambda data: written.append(bytes(data))
+        transport.having_timeout = ContextMock()
+        conn = Connection(
+            authentication=AMQPLAIN('foo', 'bar'),
+            blocked_publish_policy='queue',
+            blocked_publish_buffer_size=100000,
+        )
+        conn.frame_max = 56
+        conn._publish_gate.frame_max = 56
+        conn.transport = transport
+        conn._frame_writer = frame_writer(conn, transport)
+        conn._publish_gate.bind(
+            conn._frame_writer, transport.write, None,
+        )
+        conn._frame_writer = conn._publish_gate.write
+        conn._on_blocked()
+
+        channel = Channel(conn, 1)
+        channel._basic_publish(Message(b'x' * 100), '', '')
+        assert not written
+
+        body_frames_seen = 0
+
+        def reblock_after_second_body_frame(data):
+            nonlocal body_frames_seen
+            written.append(bytes(data))
+            if parse_frame(data)[0] == 3:
+                body_frames_seen += 1
+                if body_frames_seen == 2:
+                    conn._on_blocked()
+
+        transport.write.side_effect = reblock_after_second_body_frame
+        conn._on_unblocked()
+        assert [parse_frame(frame)[0] for frame in written] == [1, 2, 3, 3]
+        assert conn._publish_gate.queue[0].sent_frames == 4
+
+        transport.write.side_effect = lambda data: written.append(bytes(data))
+        conn._on_unblocked()
+        assert [parse_frame(frame)[0] for frame in written] == [
+            1, 2, 3, 3, 3,
+        ]
+        assert not conn._publish_gate.queue
+
+    def test_blocked_publish_confirm_close_does_not_fake_ack(self):
+        from amqp.exceptions import Blocked
+        from amqp.method_framing import frame_writer
+        from amqp.basic_message import Message
+        from amqp.channel import Channel
+
+        written = []
+        transport = Mock(name='transport')
+        transport.write.side_effect = lambda data: written.append(bytes(data))
+        transport.having_timeout = ContextMock()
+        conn = Connection(
+            authentication=AMQPLAIN('foo', 'bar'),
+            confirm_publish=True,
+            blocked_publish_policy='queue',
+            blocked_publish_buffer_size=100000,
+        )
+        conn.transport = transport
+        conn._frame_writer = frame_writer(conn, transport)
+        conn._publish_gate.bind(
+            conn._frame_writer, transport.write, None,
+        )
+        conn._frame_writer = conn._publish_gate.write
+        conn._on_blocked()
+
+        channel = Channel(conn, 1)
+        channel.confirm_select = Mock(name='confirm_select')
+        channel.drain_events = Mock(name='drain_events')
+        pending = channel._basic_publish(Message(b'queued'), '', '')
+        conn.collect()
+
+        assert pending.failed
+        assert isinstance(pending.reason, Blocked)
+        with pytest.raises(Blocked):
+            channel.wait(
+                [spec.Basic.Ack, spec.Basic.Nack],
+                callback=pending, timeout=0,
+            )
+        assert not any(
+            parse_frame(frame)[2] == spec.Basic.Ack
+            for frame in written
+        )
+
+    def test_blocked_publish_buffer_budget_rejects(self):
+        from amqp.exceptions import Blocked
+        from amqp.method_framing import frame_writer
+        from amqp.basic_message import Message
+        from amqp.channel import Channel
+
+        written = []
+        transport = Mock(name='transport')
+        transport.write.side_effect = lambda data: written.append(bytes(data))
+        transport.having_timeout = ContextMock()
+        conn = Connection(
+            authentication=AMQPLAIN('foo', 'bar'),
+            blocked_publish_policy='queue',
+            blocked_publish_buffer_size=39,
+        )
+        conn.transport = transport
+        conn._frame_writer = frame_writer(conn, transport)
+        conn._publish_gate.bind(
+            conn._frame_writer, transport.write, None,
+        )
+        conn._frame_writer = conn._publish_gate.write
+        conn._on_blocked()
+
+        channel = Channel(conn, 1)
+        channel._basic_publish(Message(b''), '', '')
+        with pytest.raises(Blocked, match='buffer full'):
+            channel._basic_publish(Message(b'x'), '', '')
+        assert not written
+        assert conn._publish_gate.buffered_bytes == 39
+
+    def test_blocked_publish_close_fails_queue(self):
+        from amqp.exceptions import Blocked
+        from amqp.method_framing import frame_writer
+        from amqp.basic_message import Message
+        from amqp.channel import Channel
+
+        written = []
+        transport = Mock(name='transport')
+        transport.write.side_effect = lambda data: written.append(bytes(data))
+        transport.having_timeout = ContextMock()
+        conn = Connection(
+            authentication=AMQPLAIN('foo', 'bar'),
+            blocked_publish_policy='queue',
+            blocked_publish_buffer_size=100000,
+        )
+        conn.transport = transport
+        conn._frame_writer = frame_writer(conn, transport)
+        conn._publish_gate.bind(
+            conn._frame_writer, transport.write, None,
+        )
+        conn._frame_writer = conn._publish_gate.write
+        conn._on_blocked()
+
+        channel = Channel(conn, 1)
+        pending = channel._basic_publish(Message(b'queued'), '', 'key')
+        conn.collect()
+
+        assert pending.failed
+        assert isinstance(pending.reason, Blocked)
+        assert not any(
+            parse_frame(frame)[2] == spec.Basic.Publish for frame in written
         )
