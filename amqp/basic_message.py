@@ -100,17 +100,20 @@ class Message(GenericContent):
         ('cluster_id', 's')
     ]
 
-    def __init__(self, body='', children=None, channel=None, **properties):
+    def __init__(self, body='', children=None, channel=None,
+                 delivery_handle=None, **properties):
         super().__init__(**properties)
         #: set by basic_consume/basic_get
         self.delivery_info = None
         self.body = body
         self.channel = channel
+        self.delivery_handle = delivery_handle
 
     __slots__ = (
         "delivery_info",
         "body",
         "channel",
+        "delivery_handle",
         )
 
     @property

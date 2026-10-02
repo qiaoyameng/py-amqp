@@ -29,6 +29,7 @@ del(re)
 from .basic_message import Message  # noqa
 from .channel import Channel  # noqa
 from .connection import Connection  # noqa
+from .delivery import DeliveryHandle, DeliveryTracker  # noqa
 from .exceptions import (AccessRefused, AMQPError,  # noqa
                          AMQPNotImplementedError, ChannelError, ChannelNotOpen,
                          ConnectionError, ConnectionForced, ConsumerCancelled,
@@ -45,6 +46,8 @@ __all__ = (
     'Connection',
     'Channel',
     'Message',
+    'DeliveryHandle',
+    'DeliveryTracker',
     'promise',
     'AMQPError',
     'ConnectionError',

@@ -1,6 +1,6 @@
 import socket
 from struct import pack
-from unittest.mock import ANY, MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 import pytest
 from vine import promise
@@ -358,6 +358,253 @@ class test_Channel:
             'routing_key': 'rkey',
         }
 
+    def test_delivery_handle_coalesces_completed_prefix(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.callbacks['consumer'] = Mock()
+        messages = [Message(), Message(), Message()]
+
+        for index, message in enumerate(messages, 1):
+            tracked._on_basic_deliver(
+                'consumer', index, False, 'ex', 'rkey', message
+            )
+
+        messages[1].delivery_handle.ack()
+        messages[2].delivery_handle.ack()
+        tracked.send_method.assert_not_called()
+
+        messages[0].delivery_handle.ack()
+        tracked.send_method.assert_called_once_with(
+            spec.Basic.Ack, 'Lb', (3, True),
+        )
+
+    def test_basic_ack_tracks_handles_without_resending_prefix(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.callbacks['consumer'] = Mock()
+        messages = [Message(), Message(), Message()]
+
+        for index, message in enumerate(messages, 1):
+            tracked._on_basic_deliver(
+                'consumer', index, False, 'ex', 'rkey', message
+            )
+
+        tracked.basic_ack(2, multiple=True)
+
+        assert messages[0].delivery_handle.settled
+        assert messages[1].delivery_handle.settled
+        assert not messages[2].delivery_handle.settled
+        tracked.send_method.assert_called_once_with(
+            spec.Basic.Ack, 'Lb', (2, True),
+        )
+
+        messages[2].delivery_handle.ack()
+        tracked.send_method.assert_called_with(
+            spec.Basic.Ack, 'Lb', (3, False),
+        )
+
+    def test_delivery_handle_sends_completed_prefix_before_pending(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.callbacks['consumer'] = Mock()
+        messages = [Message(), Message(), Message()]
+
+        for index, message in enumerate(messages, 1):
+            tracked._on_basic_deliver(
+                'consumer', index, False, 'ex', 'rkey', message
+            )
+
+        messages[0].delivery_handle.ack()
+        messages[1].delivery_handle.ack()
+        tracked.send_method.assert_called_once_with(
+            spec.Basic.Ack, 'Lb', (2, True),
+        )
+
+    def test_flush_delivery_acks_does_not_cross_pending_message(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.callbacks['consumer'] = Mock()
+        messages = [Message(), Message(), Message()]
+
+        for index, message in enumerate(messages, 1):
+            tracked._on_basic_deliver(
+                'consumer', index, False, 'ex', 'rkey', message
+            )
+
+        messages[0].delivery_handle.ack()
+        messages[2].delivery_handle.ack()
+        tracked.send_method.assert_not_called()
+
+        tracked.flush_delivery_acks()
+        tracked.send_method.assert_called_once_with(
+            spec.Basic.Ack, 'Lb', (1, False),
+        )
+
+    def test_delivery_handle_reject_prevents_multiple_ack_across_it(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.callbacks['consumer'] = Mock()
+        messages = [Message(), Message(), Message()]
+
+        for index, message in enumerate(messages, 1):
+            tracked._on_basic_deliver(
+                'consumer', index, False, 'ex', 'rkey', message
+            )
+
+        messages[0].delivery_handle.reject()
+        messages[1].delivery_handle.ack()
+        messages[2].delivery_handle.ack()
+
+        assert tracked.send_method.call_args_list == [
+            call(spec.Basic.Reject, 'Lb', (1, True)),
+            call(spec.Basic.Ack, 'Lb', (2, False)),
+            call(spec.Basic.Ack, 'Lb', (3, False)),
+        ]
+
+    def test_delivery_handle_nack_sends_nack_frame(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.callbacks['consumer'] = Mock()
+        message = Message()
+        tracked._on_basic_deliver(
+            'consumer', 5, False, 'ex', 'rkey', message
+        )
+
+        message.delivery_handle.nack(requeue=True)
+
+        tracked.send_method.assert_called_once_with(
+            spec.Basic.Nack, 'Lbb', (5, False, True),
+        )
+
+    def test_delivery_handle_can_only_settle_once(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.callbacks['consumer'] = Mock()
+        message = Message()
+        tracked._on_basic_deliver(
+            'consumer', 5, False, 'ex', 'rkey', message
+        )
+
+        message.delivery_handle.ack()
+        with pytest.raises(RuntimeError):
+            message.delivery_handle.nack()
+
+    def test_delivery_handles_are_invalidated_when_channel_collects(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.callbacks['consumer'] = Mock()
+        message = Message()
+        tracked._on_basic_deliver(
+            'consumer', 5, False, 'ex', 'rkey', message
+        )
+
+        tracked.collect()
+
+        with pytest.raises(RecoverableConnectionError):
+            message.delivery_handle.ack()
+        tracked.send_method.assert_not_called()
+
+    def test_delivery_handles_are_invalidated_when_channel_closes(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.is_open = True
+        tracked.callbacks['consumer'] = Mock()
+        message = Message()
+        tracked._on_basic_deliver(
+            'consumer', 5, False, 'ex', 'rkey', message
+        )
+
+        tracked.close()
+
+        with pytest.raises(RecoverableConnectionError):
+            message.delivery_handle.ack()
+        tracked.send_method.assert_called_once_with(
+            spec.Channel.Close, 'BsBB',
+            (0, '', 0, 0),
+            wait=spec.Channel.CloseOk,
+        )
+
+    def test_delivery_handle_not_created_for_no_ack_consumer(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.no_ack_consumers.add('consumer')
+        tracked.callbacks['consumer'] = Mock()
+        message = Message()
+
+        tracked._on_basic_deliver(
+            'consumer', 5, True, 'ex', 'rkey', message
+        )
+
+        assert message.delivery_handle is None
+        tracked.send_method.assert_not_called()
+
+    def test_basic_consume_delivery_handle_requires_ack_mode(self):
+        with pytest.raises(ValueError):
+            self.c.basic_consume(
+                'q', 'consumer', no_ack=True, delivery_handle=True
+            )
+        self.c.send_method.assert_not_called()
+
+    def test_basic_consume_delivery_handle(self):
+        self.c.send_method.return_value = ('consumer',)
+        callback = Mock()
+        self.c.basic_consume(
+            'q', 'consumer', delivery_handle=True, callback=callback
+        )
+        assert 'consumer' in self.c._delivery_handle_consumers
+
+        message = Message()
+        self.c._on_basic_deliver(
+            'consumer', 7, False, 'ex', 'rkey', message
+        )
+
+        message.delivery_handle.ack()
+        self.c.send_method.assert_called_with(
+            spec.Basic.Ack, 'Lb', (7, False),
+        )
+
+    def test_basic_get_delivery_handle(self):
+        tracked = Channel(self.conn, 4)
+        tracked.send_method = Mock(name='send_method')
+        tracked.send_method.return_value = (
+            7, False, 'ex', 'rkey', 0, Message()
+        )
+
+        message = tracked.basic_get('q', delivery_handle=True)
+
+        assert message.delivery_handle is not None
+        message.delivery_handle.ack()
+        tracked.send_method.assert_called_with(
+            spec.Basic.Ack, 'Lb', (7, False),
+        )
+
+    def test_basic_get_delivery_handle_requires_ack_mode(self):
+        with pytest.raises(ValueError):
+            self.c.basic_get('q', no_ack=True, delivery_handle=True)
+        self.c.send_method.assert_not_called()
+
+    def test_redelivered_message_gets_new_delivery_identity(self):
+        tracked = Channel(self.conn, 4, delivery_handles=True)
+        tracked.send_method = Mock(name='send_method')
+        tracked.callbacks['consumer'] = Mock()
+        first = Message()
+        second = Message()
+
+        tracked._on_basic_deliver(
+            'consumer', 9, False, 'ex', 'rkey', first
+        )
+        tracked._on_basic_deliver(
+            'consumer', 9, True, 'ex', 'rkey', second
+        )
+
+        assert first.delivery_handle is not second.delivery_handle
+        with pytest.raises(RecoverableConnectionError):
+            first.delivery_handle.ack()
+        second.delivery_handle.ack()
+        tracked.send_method.assert_called_once_with(
+            spec.Basic.Ack, 'Lb', (9, False),
+        )
+
     def test_basic_get(self):
         self.c._on_get_empty = Mock()
         self.c._on_get_ok = Mock()
@@ -432,7 +679,7 @@ class test_Channel:
         # sent Nack message.
 
         # Nack frame construction
-        args = dumps('Lb', (1, False))
+        args = dumps('Lbb', (1, False, False))
         frame = (b''.join([pack('>HH', *spec.Basic.Nack), args]))
 
         def wait(method, *args, **kwargs):
@@ -566,6 +813,12 @@ class test_Channel:
             spec.Basic.Reject, 'Lb', (123, True),
         )
 
+    def test_basic_nack(self):
+        self.c.basic_nack(123, multiple=True, requeue=True)
+        self.c.send_method.assert_called_with(
+            spec.Basic.Nack, 'Lbb', (123, True, True),
+        )
+
     def test_on_basic_return(self):
         with pytest.raises(NotFound):
             self.c._on_basic_return(404, 'text', 'ex', 'rkey', 'msg')
@@ -613,5 +866,5 @@ class test_Channel:
     def test_on_basic_nack(self):
         callback = Mock(name='callback')
         self.c.events['basic_nack'].add(callback)
-        self.c._on_basic_nack(123, True)
+        self.c._on_basic_nack(123, True, False)
         callback.assert_called_with(123, True)

@@ -10,6 +10,7 @@ from vine import ensure_promise
 
 from . import spec
 from .abstract_channel import AbstractChannel
+from .delivery import DeliveryTracker
 from .exceptions import (ChannelError, ConsumerCancelled, MessageNacked,
                          RecoverableConnectionError,
                          error_for_code)
@@ -86,7 +87,7 @@ class Channel(AbstractChannel):
         spec.method(spec.Tx.SelectOk),
         spec.method(spec.Confirm.SelectOk),
         spec.method(spec.Basic.Ack, 'Lb'),
-        spec.method(spec.Basic.Nack, 'Lb'),
+        spec.method(spec.Basic.Nack, 'Lbb'),
     }
     _METHODS = {m.method_sig: m for m in _METHODS}
 
@@ -95,7 +96,9 @@ class Channel(AbstractChannel):
     )
 
     def __init__(self, connection,
-                 channel_id=None, auto_decode=True, on_open=None):
+                 channel_id=None, auto_decode=True, on_open=None,
+                 delivery_handles=False, delivery_handle=False,
+                 track_deliveries=False):
         if channel_id:
             connection._claim_channel_id(channel_id)
         else:
@@ -113,6 +116,15 @@ class Channel(AbstractChannel):
         self.auto_decode = auto_decode
         self.events = defaultdict(set)
         self.no_ack_consumers = set()
+        self._delivery_handles_enabled = (
+            delivery_handles or delivery_handle or track_deliveries
+        )
+        self._delivery_handle_consumers = set()
+        self._delivery_tracker = (
+            DeliveryTracker(self)
+            if self._delivery_handles_enabled else None
+        )
+        self._multiple_delivery_acks = self._delivery_handles_enabled
 
         self.on_open = ensure_promise(on_open)
 
@@ -171,9 +183,17 @@ class Channel(AbstractChannel):
         self.cancel_callbacks.clear()
         self.events.clear()
         self.no_ack_consumers.clear()
+        self._delivery_handle_consumers.clear()
+        if self._delivery_tracker is not None:
+            self._delivery_tracker.close()
 
     def _do_revive(self):
         self.is_open = False
+        if self._delivery_tracker is not None:
+            self._delivery_tracker = DeliveryTracker(
+                self,
+                multiple_ack_allowed=self._multiple_delivery_acks
+            )
         self.open()
 
     def close(self, reply_code=0, reply_text='', method_sig=(0, 0),
@@ -232,6 +252,8 @@ class Channel(AbstractChannel):
                 return
 
             self.is_closing = True
+            if self._delivery_tracker is not None:
+                self._delivery_tracker.close()
             return self.send_method(
                 spec.Channel.Close, argsig,
                 (reply_code, reply_text, method_sig[0], method_sig[1]),
@@ -1358,7 +1380,7 @@ class Channel(AbstractChannel):
     #     acknowledgments on Basic content.
     #
 
-    def basic_ack(self, delivery_tag, multiple=False, argsig='Lb'):
+    def _basic_ack(self, delivery_tag, multiple=False, argsig='Lb'):
         """Acknowledge one or more messages.
 
         This method acknowledges one or more messages delivered via
@@ -1408,6 +1430,21 @@ class Channel(AbstractChannel):
             spec.Basic.Ack, argsig, (delivery_tag, multiple),
         )
 
+    def basic_ack(self, delivery_tag, multiple=False, argsig='Lb'):
+        """Acknowledge one or more messages."""
+        tracker = self._delivery_tracker
+        if tracker is not None:
+            return tracker.acknowledge_external(
+                delivery_tag, multiple=multiple, argsig=argsig
+            )
+        return self._basic_ack(delivery_tag, multiple, argsig)
+
+    def flush_delivery_acks(self):
+        """Send buffered ACK prefixes that can safely be coalesced."""
+        tracker = self._delivery_tracker
+        if tracker is not None:
+            return tracker.flush()
+
     def basic_cancel(self, consumer_tag, nowait=False, argsig='sb'):
         """End a queue consumer.
 
@@ -1449,6 +1486,7 @@ class Channel(AbstractChannel):
         """
         if self.connection is not None:
             self.no_ack_consumers.discard(consumer_tag)
+            self._delivery_handle_consumers.discard(consumer_tag)
             return self.send_method(
                 spec.Basic.Cancel, argsig, (consumer_tag, nowait),
                 wait=None if nowait else spec.Basic.CancelOk,
@@ -1471,11 +1509,13 @@ class Channel(AbstractChannel):
 
     def _remove_tag(self, consumer_tag):
         self.callbacks.pop(consumer_tag, None)
+        self._delivery_handle_consumers.discard(consumer_tag)
         return self.cancel_callbacks.pop(consumer_tag, None)
 
     def basic_consume(self, queue='', consumer_tag='', no_local=False,
                       no_ack=False, exclusive=False, nowait=False,
                       callback=None, arguments=None, on_cancel=None,
+                      delivery_handle=False,
                       argsig='BssbbbbF'):
         """Start a queue consumer.
 
@@ -1570,7 +1610,17 @@ class Channel(AbstractChannel):
                 as the single argument.  If no callable is specified,
                 messages are quietly discarded, no_ack should probably
                 be set to True in that case.
+
+            delivery_handle: boolean
+
+                Attach a :class:`~amqp.delivery.DeliveryHandle` to each
+                delivered message as ``message.delivery_handle``.
         """
+        if delivery_handle and no_ack:
+            raise ValueError(
+                'delivery_handle cannot be enabled for a no_ack consumer'
+            )
+
         p = self.send_method(
             spec.Basic.Consume, argsig,
             (
@@ -1600,6 +1650,12 @@ class Channel(AbstractChannel):
             self.cancel_callbacks[consumer_tag] = on_cancel
         if no_ack:
             self.no_ack_consumers.add(consumer_tag)
+        elif delivery_handle:
+            if self._delivery_tracker is None:
+                self._delivery_tracker = DeliveryTracker(
+                    self, multiple_ack_allowed=False
+                )
+            self._delivery_handle_consumers.add(consumer_tag)
 
         if not nowait:
             return consumer_tag
@@ -1609,6 +1665,12 @@ class Channel(AbstractChannel):
     def _on_basic_deliver(self, consumer_tag, delivery_tag, redelivered,
                           exchange, routing_key, msg):
         msg.channel = self
+        delivery = None
+        if consumer_tag not in self.no_ack_consumers and \
+                self._delivery_tracker is not None:
+            delivery = self._delivery_tracker.register(
+                delivery_tag, redelivered=bool(redelivered)
+            )
         msg.delivery_info = {
             'consumer_tag': consumer_tag,
             'delivery_tag': delivery_tag,
@@ -1616,6 +1678,12 @@ class Channel(AbstractChannel):
             'exchange': exchange,
             'routing_key': routing_key,
         }
+        attach_handle = (
+            self._delivery_handles_enabled or
+            consumer_tag in self._delivery_handle_consumers
+        )
+        if delivery is not None and attach_handle:
+            msg.delivery_handle = delivery
 
         try:
             fun = self.callbacks[consumer_tag]
@@ -1628,7 +1696,8 @@ class Channel(AbstractChannel):
         else:
             fun(msg)
 
-    def basic_get(self, queue='', no_ack=False, argsig='Bsb'):
+    def basic_get(self, queue='', no_ack=False, delivery_handle=False,
+                  argsig='Bsb'):
         """Direct access to a queue.
 
         This method provides a direct access to the messages in a
@@ -1665,20 +1734,45 @@ class Channel(AbstractChannel):
         Non-blocking, returns a amqp.basic_message.Message object,
         or None if queue is empty.
         """
+        if delivery_handle and no_ack:
+            raise ValueError(
+                'delivery_handle cannot be enabled for a no_ack get'
+            )
+
         ret = self.send_method(
             spec.Basic.Get, argsig, (0, queue, no_ack),
             wait=[spec.Basic.GetOk, spec.Basic.GetEmpty], returns_tuple=True,
         )
         if not ret or len(ret) < 2:
             return self._on_get_empty(*ret)
+        if no_ack or delivery_handle:
+            return self._on_get_ok(
+                *ret, no_ack=no_ack, delivery_handle=delivery_handle
+            )
         return self._on_get_ok(*ret)
 
     def _on_get_empty(self, cluster_id=None):
         pass
 
     def _on_get_ok(self, delivery_tag, redelivered, exchange, routing_key,
-                   message_count, msg):
+                   message_count, msg, no_ack=False, delivery_handle=False):
         msg.channel = self
+        delivery = None
+        attach_handle = (
+            self._delivery_handles_enabled or delivery_handle
+        )
+        if not no_ack and self._delivery_tracker is not None:
+            delivery = self._delivery_tracker.register(
+                delivery_tag, redelivered=bool(redelivered)
+            )
+        elif not no_ack and attach_handle:
+            if self._delivery_tracker is None:
+                self._delivery_tracker = DeliveryTracker(
+                    self, multiple_ack_allowed=False
+                )
+            delivery = self._delivery_tracker.register(
+                delivery_tag, redelivered=bool(redelivered)
+            )
         msg.delivery_info = {
             'delivery_tag': delivery_tag,
             'redelivered': redelivered,
@@ -1686,6 +1780,8 @@ class Channel(AbstractChannel):
             'routing_key': routing_key,
             'message_count': message_count
         }
+        if delivery is not None:
+            msg.delivery_handle = delivery
         return msg
 
     def _basic_publish(self, msg, exchange='', routing_key='',
@@ -1933,7 +2029,7 @@ class Channel(AbstractChannel):
     def basic_recover_async(self, requeue=False):
         return self.send_method(spec.Basic.RecoverAsync, 'b', (requeue,))
 
-    def basic_reject(self, delivery_tag, requeue, argsig='Lb'):
+    def _basic_reject(self, delivery_tag, requeue, argsig='Lb'):
         """Reject an incoming message.
 
         This method allows a client to reject a message.  It can be
@@ -2004,6 +2100,37 @@ class Channel(AbstractChannel):
         """
         return self.send_method(
             spec.Basic.Reject, argsig, (delivery_tag, requeue),
+        )
+
+    def basic_reject(self, delivery_tag, requeue, argsig='Lb'):
+        """Reject an incoming message."""
+        tracker = self._delivery_tracker
+        if tracker is not None:
+            return tracker.reject_external(
+                delivery_tag, requeue, argsig=argsig
+            )
+        return self._basic_reject(delivery_tag, requeue, argsig)
+
+    def _basic_nack(self, delivery_tag, multiple=False, requeue=False,
+                    argsig='Lbb'):
+        """Reject one or more messages using the RabbitMQ nack extension."""
+        return self.send_method(
+            spec.Basic.Nack, argsig,
+            (delivery_tag, multiple, requeue),
+        )
+
+    def basic_nack(self, delivery_tag, multiple=False, requeue=False,
+                   argsig='Lbb'):
+        """Reject one or more incoming messages."""
+        tracker = self._delivery_tracker
+        if tracker is not None:
+            return tracker.nack_external(
+                delivery_tag, multiple=multiple, requeue=requeue,
+                argsig=argsig
+            )
+        return self._basic_nack(
+            delivery_tag, multiple=multiple, requeue=requeue,
+            argsig=argsig
         )
 
     def _on_basic_return(self, reply_code, reply_text,
@@ -2125,6 +2252,6 @@ class Channel(AbstractChannel):
         for callback in self.events['basic_ack']:
             callback(delivery_tag, multiple)
 
-    def _on_basic_nack(self, delivery_tag, multiple):
+    def _on_basic_nack(self, delivery_tag, multiple, requeue):
         for callback in self.events['basic_nack']:
             callback(delivery_tag, multiple)

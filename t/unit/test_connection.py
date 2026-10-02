@@ -371,6 +371,18 @@ class test_Connection:
         c2 = self.conn.channel(3, callback)
         assert c2 is c
 
+    def test_channel_with_delivery_handles(self):
+        self.conn.channel(4, delivery_handles=True)
+        self.conn.Channel.assert_called_with(
+            self.conn, 4, on_open=None, delivery_handles=True
+        )
+
+    def test_channel_with_delivery_handle_alias(self):
+        self.conn.channel(5, delivery_handle=True)
+        self.conn.Channel.assert_called_with(
+            self.conn, 5, on_open=None, delivery_handle=True
+        )
+
     def test_channel_when_connection_is_closed(self):
         self.conn.collect()
         callback = Mock(name='callback')

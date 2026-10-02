@@ -502,7 +502,9 @@ class Connection(AbstractChannel):
             self._used_channel_ids.append(channel_id)
             return channel_id
 
-    def channel(self, channel_id=None, callback=None):
+    def channel(self, channel_id=None, callback=None,
+                delivery_handles=False, delivery_handle=False,
+                track_deliveries=False):
         """Create new channel.
 
         Fetch a Channel object identified by the numeric channel_id, or
@@ -514,7 +516,16 @@ class Connection(AbstractChannel):
         try:
             return self.channels[channel_id]
         except KeyError:
-            channel = self.Channel(self, channel_id, on_open=callback)
+            channel_kwargs = {'on_open': callback}
+            if delivery_handles:
+                channel_kwargs['delivery_handles'] = True
+            if delivery_handle:
+                channel_kwargs['delivery_handle'] = True
+            if track_deliveries:
+                channel_kwargs['track_deliveries'] = True
+            channel = self.Channel(
+                self, channel_id, **channel_kwargs
+            )
             channel.open()
             return channel
 
