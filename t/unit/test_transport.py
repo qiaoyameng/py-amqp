@@ -10,8 +10,9 @@ from unittest.mock import ANY, MagicMock, Mock, call, patch, sentinel
 import pytest
 
 from amqp import transport
-from amqp.exceptions import UnexpectedFrame
-from amqp.transport import _AbstractTransport
+from amqp.exceptions import FrameSyntaxError, UnexpectedFrame
+from amqp.transport import (END_OF_STREAM, FrameDecoder,
+                            _AbstractTransport)
 
 SIGNED_INT_MAX = 0x7FFFFFFF
 
@@ -68,6 +69,112 @@ class MockSocket:
 TCP_KEEPIDLE = 4
 TCP_KEEPINTVL = 5
 TCP_KEEPCNT = 6
+
+
+def amqp_frame(frame_type, channel, payload=b''):
+    return (
+        pack('>BHI', frame_type, channel, len(payload))
+        + payload
+        + b'\xce'
+    )
+
+
+class test_FrameDecoder:
+
+    def test_arbitrary_chunks_match_one_shot(self):
+        frames = (
+            amqp_frame(8, 0),
+            amqp_frame(1, 1, b'method'),
+            amqp_frame(3, 2, b'body'),
+            amqp_frame(1, 65535, b'done'),
+        )
+        stream = b''.join(frames)
+
+        for split in range(len(stream) + 1):
+            one_shot = FrameDecoder()
+            one_shot.feed(stream)
+            expected = []
+            while True:
+                frame = one_shot.next_frame()
+                if frame is None:
+                    break
+                expected.append(frame)
+            assert one_shot.next_frame() is None
+
+            chunked = FrameDecoder()
+            if split == 0:
+                chunked.feed(stream)
+            elif split == len(stream):
+                chunked.feed(stream)
+            else:
+                chunked.feed(stream[:split])
+                chunked.feed(stream[split:])
+            decoded = []
+            while True:
+                frame = chunked.next_frame()
+                if frame is None:
+                    break
+                decoded.append(frame)
+
+            assert decoded == expected
+            assert chunked.offset == len(stream)
+
+    @pytest.mark.parametrize('frame_max', (23, 24))
+    def test_negotiated_frame_max_is_checked_from_header(self, frame_max):
+        decoder = FrameDecoder(frame_max=frame_max)
+        with pytest.raises(FrameSyntaxError):
+            decoder.feed(amqp_frame(1, 1, b'x' * 17))
+
+    def test_hard_frame_max_is_checked_from_header(self):
+        decoder = FrameDecoder(hard_frame_max=16)
+        with pytest.raises(FrameSyntaxError):
+            decoder.feed(amqp_frame(1, 1, b'x' * 17))
+
+    def test_malicious_length_header_is_rejected_without_payload(self):
+        decoder = FrameDecoder(frame_max=25)
+        with pytest.raises(FrameSyntaxError):
+            decoder.feed(pack('>BHI', 1, 1, 100))
+        assert decoder.offset == 7
+
+    def test_valid_frame_is_returned_before_later_malicious_header(self):
+        decoder = FrameDecoder(frame_max=25)
+        stream = amqp_frame(8, 0) + pack('>BHI', 1, 1, 100)
+        decoder.feed(stream)
+        assert decoder.next_frame() == (8, 0, b'')
+        with pytest.raises(FrameSyntaxError):
+            decoder.next_frame()
+
+    def test_partial_frame_eof_is_distinct_from_clean_eof(self):
+        decoder = FrameDecoder()
+        decoder.feed(amqp_frame(1, 1, b'ok'))
+        assert decoder.next_frame() == (1, 1, b'ok')
+        decoder.feed(b'')
+        assert decoder.next_frame() is END_OF_STREAM
+
+        partial = FrameDecoder()
+        partial.feed(pack('>BHI', 1, 1, 2) + b'a')
+        partial.feed(b'')
+        with pytest.raises(EOFError):
+            partial.next_frame()
+
+    def test_bad_frame_end_is_terminal(self):
+        decoder = FrameDecoder()
+        stream = pack('>BHI', 1, 1, 0) + b'\x00' + amqp_frame(8, 0)
+        decoder.feed(stream)
+
+        with pytest.raises(UnexpectedFrame):
+            decoder.next_frame()
+        with pytest.raises(UnexpectedFrame):
+            decoder.next_frame()
+        with pytest.raises(UnexpectedFrame):
+            decoder.feed(b'')
+
+    def test_bytearray_and_memoryview_are_accepted(self):
+        frame = amqp_frame(1, 1, b'ok')
+        for chunk in (bytearray(frame), memoryview(frame)):
+            decoder = FrameDecoder()
+            decoder.feed(chunk)
+            assert decoder.next_frame() == (1, 1, b'ok')
 
 
 class test_socket_options:
@@ -361,14 +468,16 @@ class test_AbstractTransport:
         assert ex.value.message == \
             'Received frame_end 0x13 while expecting 0xce'
 
-    def test_read_frame__long(self):
+    def test_read_frame__long_header_is_rejected_immediately(self):
         self.t._read = Mock()
-        self.t._read.side_effect = [pack('>BHI', 1, 1, SIGNED_INT_MAX + 16),
-                                    b'read1', b'read2', b'\xce']
-        frame_type, channel, payload = self.t.read_frame()
-        assert frame_type == 1
-        assert channel == 1
-        assert payload == b'read1read2'
+        self.t.connected = True
+        self.t._read.side_effect = [
+            pack('>BHI', 1, 1, SIGNED_INT_MAX + 16),
+        ]
+        with pytest.raises(FrameSyntaxError):
+            self.t.read_frame()
+        self.t._read.assert_called_once_with(7, True)
+        assert self.t.connected
 
     def transport_read_EOF(self):
         for host, is_ssl in (('localhost:5672', False),
@@ -976,11 +1085,11 @@ class test_TCPTransport:
         with pytest.raises(socket.timeout):
             self.t.read_frame()
 
-        assert len(self.t._read_buffer) == 7
+        assert self.t._frame_decoder.buffered_bytes == 7
 
         frame_type, channel, payload = self.t.read_frame()
 
-        assert len(self.t._read_buffer) == 0
+        assert self.t._frame_decoder.buffered_bytes == 0
         assert frame_type == 1
         assert channel == 1
         assert payload == b'thequickbrownfox'

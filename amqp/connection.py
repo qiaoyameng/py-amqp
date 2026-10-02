@@ -320,6 +320,7 @@ class Connection(AbstractChannel):
                 self.host, self.connect_timeout, self.ssl,
                 self.read_timeout, self.write_timeout,
                 socket_settings=self.socket_settings,
+                frame_max=self.frame_max,
             )
             self.transport.connect()
             self.on_inbound_frame = self.frame_handler_cls(
@@ -426,6 +427,7 @@ class Connection(AbstractChannel):
         client_heartbeat = self.client_heartbeat or 0
         self.channel_max = channel_max or self.channel_max
         self.frame_max = frame_max or self.frame_max
+        self.transport.frame_max = self.frame_max
         self.server_heartbeat = server_heartbeat or 0
 
         # negotiate the heartbeat interval to the smaller of the

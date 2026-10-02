@@ -8,6 +8,10 @@
 
 .. automodule:: amqp.transport
 
+.. autoclass:: FrameDecoder
+    :members:
+    :undoc-members:
+
 .. autoclass:: _AbstractTransport
     :members:
     :undoc-members:

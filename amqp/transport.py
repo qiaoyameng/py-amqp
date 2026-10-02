@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from ssl import SSLError
 from struct import pack, unpack
 
-from .exceptions import UnexpectedFrame
+from .exceptions import FrameSyntaxError, UnexpectedFrame
 from .platform import KNOWN_TCP_OPTS, SOL_TCP
 from .utils import set_cloexec
 
@@ -21,6 +21,10 @@ AMQP_PORT = 5672
 EMPTY_BUFFER = bytes()
 
 SIGNED_INT_MAX = 0x7FFFFFFF
+
+FRAME_END = 206
+
+END_OF_STREAM = object()
 
 # Yes, Advanced Message Queuing Protocol Protocol is redundant
 AMQP_PROTOCOL_HEADER = b'AMQP\x00\x00\x09\x01'
@@ -35,6 +39,118 @@ DEFAULT_SOCKET_SETTINGS = {
     'TCP_KEEPINTVL': 10,
     'TCP_KEEPCNT': 9,
 }
+
+
+class FrameDecoder:
+    """Incrementally decode AMQP frames from network chunks.
+
+    ``feed`` accepts any bytes-like network chunk. ``next_frame`` returns
+    a frame tuple when one is complete, ``None`` when more data is needed,
+    and :data:`END_OF_STREAM` after a clean EOF. A protocol error raises
+    immediately and leaves the decoder unusable. ``offset`` is the number
+    of connection bytes consumed by ``feed``.
+    """
+
+    EOF = END_OF_STREAM
+    NEED_DATA = None
+
+    def __init__(self, frame_max=None, hard_frame_max=SIGNED_INT_MAX):
+        self.frame_max = frame_max
+        self.hard_frame_max = hard_frame_max
+        self._buffer = bytearray()
+        self._frame_type = None
+        self._channel = None
+        self._frame_size = None
+        self._eof = False
+        self._error = None
+        self.offset = 0
+
+    def feed(self, data):
+        """Add a network chunk to the decoder."""
+        if self._error is not None:
+            raise self._error
+        if self._eof:
+            raise EOFError('Cannot feed data after end of stream')
+        if not data:
+            self._eof = True
+            return
+
+        self._buffer.extend(data)
+        self.offset += len(data)
+        if self._frame_type is None and len(self._buffer) >= 7:
+            self._read_frame_header()
+
+    def next_frame(self):
+        """Return the next frame, ``None``, or the end-of-stream sentinel."""
+        if self._error is not None:
+            raise self._error
+        if self._eof:
+            if self._buffer:
+                raise EOFError('Connection closed while reading a frame')
+            return END_OF_STREAM
+        if self._frame_type is None:
+            if len(self._buffer) < 7:
+                return None
+            self._read_frame_header()
+
+        frame_length = self._frame_size + 8
+        if len(self._buffer) < frame_length:
+            return None
+
+        payload_end = self._frame_size + 7
+        payload = bytes(self._buffer[7:payload_end])
+        frame_end = self._buffer[payload_end]
+        if frame_end != FRAME_END:
+            self._fatal(UnexpectedFrame(
+                f'Received frame_end {frame_end:#04x} while expecting 0xce'))
+
+        frame = (self._frame_type, self._channel, payload)
+        del self._buffer[:frame_length]
+        self._reset_frame_header()
+        return frame
+
+    @property
+    def bytes_needed(self):
+        """Number of bytes required before another parsing attempt."""
+        if self._error is not None or self._eof:
+            return 0
+        if self._frame_type is None:
+            return max(0, 7 - len(self._buffer))
+        return max(0, self._frame_size + 8 - len(self._buffer))
+
+    @property
+    def buffered_bytes(self):
+        """Number of bytes waiting to form a complete frame."""
+        return len(self._buffer)
+
+    def _read_frame_header(self):
+        frame_type, channel, size = unpack(
+            '>BHI', self._buffer[:7])
+        max_payload_size = self.hard_frame_max
+        if self.frame_max:
+            max_payload_size = min(
+                max_payload_size, self.frame_max - 8)
+        if size > max_payload_size:
+            limit_description = (
+                f'negotiated frame_max {self.frame_max}'
+                if self.frame_max
+                else f'hard frame limit {self.hard_frame_max + 8}'
+            )
+            self._fatal(FrameSyntaxError(
+                f'Received frame with payload size {size}, exceeding '
+                f'the {limit_description}'))
+        self._frame_type = frame_type
+        self._channel = channel
+        self._frame_size = size
+
+    def _reset_frame_header(self):
+        self._frame_type = None
+        self._channel = None
+        self._frame_size = None
+
+    def _fatal(self, error):
+        self._error = error
+        raise error
 
 
 def to_host_port(host, default=AMQP_PORT):
@@ -86,11 +202,13 @@ class _AbstractTransport:
 
     def __init__(self, host, connect_timeout=None,
                  read_timeout=None, write_timeout=None,
-                 socket_settings=None, raise_on_initial_eintr=True, **kwargs):
+                 socket_settings=None, raise_on_initial_eintr=True,
+                 frame_max=None, **kwargs):
         self.connected = False
         self.sock = None
         self.raise_on_initial_eintr = raise_on_initial_eintr
         self._read_buffer = EMPTY_BUFFER
+        self._frame_decoder = FrameDecoder(frame_max=frame_max)
         self.host, self.port = to_host_port(host)
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
@@ -102,6 +220,7 @@ class _AbstractTransport:
         "sock",
         "raise_on_initial_eintr",
         "_read_buffer",
+        "_frame_decoder",
         "host",
         "port",
         "connect_timeout",
@@ -112,6 +231,14 @@ class _AbstractTransport:
         "__dict__",
         "__weakref__",
         )
+
+    @property
+    def frame_max(self):
+        return self._frame_decoder.frame_max
+
+    @frame_max.setter
+    def frame_max(self, value):
+        self._frame_decoder.frame_max = value
 
     def __repr__(self):
         if self.sock:
@@ -292,58 +419,35 @@ class _AbstractTransport:
 
         """
         read = self._read
-        read_frame_buffer = EMPTY_BUFFER
+        decoder = self._frame_decoder
         try:
-            frame_header = read(7, True)
-            read_frame_buffer += frame_header
-            frame_type, channel, size = unpack('>BHI', frame_header)
-            # >I is an unsigned int, but the argument to sock.recv is signed,
-            # so we know the size can be at most 2 * SIGNED_INT_MAX
-            if size > SIGNED_INT_MAX:
-                part1 = read(SIGNED_INT_MAX)
+            while True:
+                frame = decoder.next_frame()
+                if frame is END_OF_STREAM:
+                    raise OSError('Server unexpectedly closed connection')
+                if frame is not None:
+                    return frame
 
-                try:
-                    part2 = read(size - SIGNED_INT_MAX)
-                except (socket.timeout, OSError, SSLError):
-                    # In case this read times out, we need to make sure to not
-                    # lose part1 when we retry the read
-                    read_frame_buffer += part1
-                    raise
-
-                payload = b''.join([part1, part2])
-            else:
-                payload = read(size)
-            read_frame_buffer += payload
-            frame_end = ord(read(1))
+                needed = decoder.bytes_needed
+                decoder.feed(read(needed, decoder._frame_type is None
+                                  and not decoder._buffer))
         except socket.timeout:
-            self._read_buffer = read_frame_buffer + self._read_buffer
+            raise
+        except (FrameSyntaxError, UnexpectedFrame):
             raise
         except (OSError, SSLError) as exc:
             if (
                 isinstance(exc, socket.error) and os.name == 'nt'
                 and exc.errno == errno.EWOULDBLOCK  # noqa
             ):
-                # On windows we can get a read timeout with a winsock error
-                # code instead of a proper socket.timeout() error, see
-                # https://github.com/celery/py-amqp/issues/320
-                self._read_buffer = read_frame_buffer + self._read_buffer
                 raise socket.timeout()
 
             if isinstance(exc, SSLError) and 'timed out' in str(exc):
-                # Don't disconnect for ssl read time outs
-                # http://bugs.python.org/issue10272
-                self._read_buffer = read_frame_buffer + self._read_buffer
                 raise socket.timeout()
 
             if exc.errno not in _UNAVAIL:
                 self.connected = False
             raise
-        # frame-end octet must contain '\xce' value
-        if frame_end == 206:
-            return frame_type, channel, payload
-        else:
-            raise UnexpectedFrame(
-                f'Received frame_end {frame_end:#04x} while expecting 0xce')
 
     def write(self, s):
         try:

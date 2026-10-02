@@ -148,6 +148,7 @@ class test_Connection:
             self.conn.host, self.conn.connect_timeout, self.conn.ssl,
             self.conn.read_timeout, self.conn.write_timeout,
             socket_settings=self.conn.socket_settings,
+            frame_max=self.conn.frame_max,
         )
 
     def test_connect__already_connected(self):
@@ -277,6 +278,7 @@ class test_Connection:
         self.conn._on_tune(345, 16, 10)
         assert self.conn.channel_max == 345
         assert self.conn.frame_max == 16
+        assert self.conn.transport.frame_max == 16
         assert self.conn.server_heartbeat == 10
         assert self.conn.heartbeat == 10
         self.conn.send_method.assert_called_with(
