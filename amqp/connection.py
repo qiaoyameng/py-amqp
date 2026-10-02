@@ -256,6 +256,10 @@ class Connection(AbstractChannel):
         self.channel_max = channel_max
         self.frame_max = frame_max
         self.client_heartbeat = heartbeat
+        #: Monotonic clock used for all heartbeat bookkeeping.
+        #: Replace this (e.g. in tests, or when embedding the connection
+        #: in a custom event loop) to control heartbeat time explicitly.
+        self._monotonic = monotonic
 
         self.confirm_publish = confirm_publish
         self.ssl = ssl
@@ -438,6 +442,14 @@ class Connection(AbstractChannel):
         # Ignore server heartbeat if client_heartbeat is disabled
         if not self.client_heartbeat:
             self.heartbeat = 0
+
+        # Reset heartbeat bookkeeping for the freshly negotiated
+        # connection: deadlines left over from a previous connection
+        # (reconnect) or from before negotiation must not cause this
+        # connection to be misjudged.
+        self.last_heartbeat_sent = self.last_heartbeat_received = \
+            self._monotonic()
+        self.prev_sent = self.prev_recv = None
 
         self.send_method(
             spec.Connection.TuneOk, argsig,
@@ -712,6 +724,50 @@ class Connection(AbstractChannel):
     def send_heartbeat(self):
         self.frame_writer(8, 0, None, None, None)
 
+    def _heartbeat_send_deadline(self, rate=2):
+        """Monotonic time at which the next heartbeat must be sent.
+
+        The connection may not be idle (in the sending direction) for
+        longer than ``heartbeat / rate`` seconds.
+        """
+        return self.last_heartbeat_sent + self.heartbeat / rate
+
+    def _heartbeat_recv_deadline(self):
+        """Monotonic time at which the peer is declared lost.
+
+        If nothing has been received for two heartbeat intervals the
+        connection is considered dead.  Returns None when nothing has
+        been received yet, in which case no receive deadline applies.
+        """
+        if not self.last_heartbeat_received:
+            return None
+        return self.last_heartbeat_received + 2 * self.heartbeat
+
+    @property
+    def next_heartbeat_deadline(self):
+        """Monotonic time at which heartbeats must be processed next.
+
+        This is the earliest of the send-idle deadline (time by which a
+        heartbeat frame must be written) and the receive-lost deadline
+        (time by which the peer must have sent something).  Embedders
+        running their own event loop can sleep until this point and then
+        call :meth:`heartbeat_tick`.
+
+        The query is read-only: it does not count as connection
+        activity, does not advance :attr:`last_heartbeat_sent`, and does
+        not read the clock.
+
+        Returns None when heartbeats are disabled (not negotiated, or
+        negotiated to 0).
+        """
+        if not self.heartbeat:
+            return None
+        deadline = self._heartbeat_send_deadline()
+        recv_deadline = self._heartbeat_recv_deadline()
+        if recv_deadline is not None:
+            deadline = min(deadline, recv_deadline)
+        return deadline
+
     def heartbeat_tick(self, rate=2):
         """Send heartbeat packets if necessary.
 
@@ -722,6 +778,8 @@ class Connection(AbstractChannel):
         Note:
             This should be called frequently, on the order of
             once per second.
+            :attr:`next_heartbeat_deadline` tells exactly when the next
+            call is required at the latest.
 
         Keyword Arguments:
             rate (int): Number of heartbeat frames to send during the heartbeat
@@ -736,15 +794,16 @@ class Connection(AbstractChannel):
         if rate <= 0:
             rate = 2
 
+        now = self._monotonic()
+
         # treat actual data exchange in either direction as a heartbeat
         sent_now = self.bytes_sent
         recv_now = self.bytes_recv
         if self.prev_sent is None or self.prev_sent != sent_now:
-            self.last_heartbeat_sent = monotonic()
+            self.last_heartbeat_sent = now
         if self.prev_recv is None or self.prev_recv != recv_now:
-            self.last_heartbeat_received = monotonic()
+            self.last_heartbeat_received = now
 
-        now = monotonic()
         AMQP_HEARTBEAT_LOGGER.debug(
             'heartbeat_tick : Prev sent/recv: %s/%s, '
             'now - %s/%s, monotonic - %s, '
@@ -760,19 +819,25 @@ class Connection(AbstractChannel):
         self.prev_sent, self.prev_recv = sent_now, recv_now
 
         # send a heartbeat if it's time to do so
-        if now > self.last_heartbeat_sent + self.heartbeat / rate:
+        if now >= self._heartbeat_send_deadline(rate):
             AMQP_HEARTBEAT_LOGGER.debug(
                 'heartbeat_tick: sending heartbeat for connection %s',
                 self._connection_id)
-            self.send_heartbeat()
-            self.last_heartbeat_sent = monotonic()
+            try:
+                self.send_heartbeat()
+            except Exception:
+                # A failed write must not postpone the next check: keep
+                # the previous last_heartbeat_sent, and reconcile
+                # prev_sent so that bytes written partially during the
+                # failed attempt are not accounted as activity later.
+                self.prev_sent = self.bytes_sent
+                raise
+            self.last_heartbeat_sent = now
 
         # if we've missed two intervals' heartbeats, fail; this gives the
         # server enough time to send heartbeats a little late
-        two_heartbeats = 2 * self.heartbeat
-        two_heartbeats_interval = self.last_heartbeat_received + two_heartbeats
-        heartbeats_missed = two_heartbeats_interval < monotonic()
-        if self.last_heartbeat_received and heartbeats_missed:
+        recv_deadline = self._heartbeat_recv_deadline()
+        if recv_deadline is not None and now >= recv_deadline:
             raise ConnectionForced('Too many heartbeats missed')
 
     @property

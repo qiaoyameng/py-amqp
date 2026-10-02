@@ -546,6 +546,125 @@ class test_Connection:
         # Verify that we wrote 2 frames
         assert self.conn.frame_writer.call_count == 2
 
+    def _install_fake_clock(self, start=1000.0):
+        now = [start]
+        self.conn._monotonic = lambda: now[0]
+        return now
+
+    def test_next_heartbeat_deadline__disabled(self):
+        assert self.conn.next_heartbeat_deadline is None
+        self.conn.heartbeat = 0
+        assert self.conn.next_heartbeat_deadline is None
+
+    def test_next_heartbeat_deadline__initial(self):
+        # Before anything is sent/received only the send-idle
+        # deadline applies; there is no receive-lost deadline yet.
+        self.conn.heartbeat = 4
+        assert self.conn.next_heartbeat_deadline == 2.0
+
+    def test_next_heartbeat_deadline__read_only(self):
+        now = self._install_fake_clock()
+        self.conn.heartbeat = 4
+        self.conn.heartbeat_tick()
+        last_sent = self.conn.last_heartbeat_sent
+        prev = (self.conn.prev_sent, self.conn.prev_recv)
+        # repeated queries neither count as activity nor advance
+        # the last-sent time
+        for _ in range(3):
+            assert self.conn.next_heartbeat_deadline == now[0] + 2.0
+        assert self.conn.last_heartbeat_sent == last_sent
+        assert (self.conn.prev_sent, self.conn.prev_recv) == prev
+
+    def test_next_heartbeat_deadline__recv_deadline_wins(self):
+        now = self._install_fake_clock()
+        self.conn.heartbeat = 4
+        self.conn.heartbeat_tick()
+        # send-idle deadline is now+2, receive-lost deadline now+8;
+        # the earlier of the two is reported
+        self.conn.last_heartbeat_received = now[0] - 7.0
+        assert self.conn.next_heartbeat_deadline == now[0] + 1.0
+
+    def test_heartbeat_tick__advance_to_deadline(self):
+        now = self._install_fake_clock()
+        self.conn.heartbeat = 4
+        self.conn.heartbeat_tick()
+        assert self.conn.frame_writer.call_count == 0
+        # advance exactly to the send-idle boundary
+        now[0] = self.conn.next_heartbeat_deadline
+        self.conn.heartbeat_tick()
+        self.conn.frame_writer.assert_called_once_with(
+            8, 0, None, None, None)
+        # next deadline moved one send interval ahead
+        assert self.conn.next_heartbeat_deadline == now[0] + 2.0
+        now[0] = self.conn.next_heartbeat_deadline
+        self.conn.heartbeat_tick()
+        assert self.conn.frame_writer.call_count == 2
+
+    def test_heartbeat_tick__connection_lost_at_deadline(self):
+        now = self._install_fake_clock()
+        self.conn.heartbeat = 4
+        self.conn.heartbeat_tick()
+        # advance to the receive-lost boundary (2 * heartbeat)
+        now[0] += 8.0
+        with pytest.raises(ConnectionError):
+            self.conn.heartbeat_tick()
+
+    def test_heartbeat_tick__failed_write_not_postponed(self):
+        now = self._install_fake_clock()
+        self.conn.heartbeat = 4
+        self.conn.heartbeat_tick()
+        now[0] = self.conn.next_heartbeat_deadline
+
+        def failing_send():
+            # partial write before the failure
+            self.conn.bytes_sent += 3
+            raise IOError('boom')
+
+        self.conn.send_heartbeat = failing_send
+        with pytest.raises(IOError):
+            self.conn.heartbeat_tick()
+        # the failed write did not advance the send bookkeeping...
+        assert self.conn.last_heartbeat_sent == 1000.0
+        # ...so the next check is not postponed
+        assert self.conn.next_heartbeat_deadline == now[0]
+        # the partially written bytes are not accounted as activity:
+        # the heartbeat is retried immediately on the next tick
+        self.conn.send_heartbeat = Mock(name='send_heartbeat')
+        self.conn.heartbeat_tick()
+        self.conn.send_heartbeat.assert_called_once_with()
+        assert self.conn.last_heartbeat_sent == now[0]
+
+    def test_heartbeat_tick__reconnect_resets_deadlines(self):
+        now = self._install_fake_clock()
+        self.conn.client_heartbeat = 4
+        self.conn._on_tune(0, 0, 4)
+        assert self.conn.heartbeat == 4
+        self.conn.heartbeat_tick()
+        # peer goes silent and the connection is declared lost
+        now[0] += 100.0
+        with pytest.raises(ConnectionError):
+            self.conn.heartbeat_tick()
+        # reconnect: negotiation restarts the heartbeat bookkeeping
+        self.conn._on_tune(0, 0, 4)
+        # the old deadlines must not misjudge the new connection
+        self.conn.heartbeat_tick()
+        assert self.conn.next_heartbeat_deadline == now[0] + 2.0
+        # and the connection is still healthy past the old deadlines
+        now[0] += 1.0
+        self.conn.heartbeat_tick()
+
+    def test_next_heartbeat_deadline__negotiation(self):
+        now = self._install_fake_clock()
+        self.conn.client_heartbeat = 10
+        self.conn._on_tune(0, 0, 4)
+        assert self.conn.heartbeat == 4
+        assert self.conn.next_heartbeat_deadline == now[0] + 2.0
+        # renegotiating to disabled heartbeats removes the deadline
+        self.conn.client_heartbeat = 0
+        self.conn._on_tune(0, 0, 4)
+        assert self.conn.heartbeat == 0
+        assert self.conn.next_heartbeat_deadline is None
+
     def test_server_capabilities(self):
         self.conn.server_properties['capabilities'] = {'foo': 1}
         assert self.conn.server_capabilities == {'foo': 1}
