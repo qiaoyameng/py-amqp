@@ -102,6 +102,16 @@ class test_frame_writer:
         self.write.assert_called()
         assert 'content_encoding' not in msg.properties
 
+    def test_write_slow_content_partial_failure_is_not_counted(self):
+        msg = Message(body=b'y' * 2048, content_type='text/plain')
+        frame = 2, 1, spec.Basic.Publish, b'x' * 10, msg
+        self.write.side_effect = (None, None, OSError)
+
+        with pytest.raises(OSError):
+            self.g(*frame)
+
+        assert self.connection.bytes_sent == 0
+
     def test_write_zero_len_body(self):
         msg = Message(body=b'', content_type='application/octet-stream')
         frame = 2, 1, spec.Basic.Publish, b'x' * 10, msg

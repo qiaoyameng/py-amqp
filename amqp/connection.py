@@ -6,6 +6,7 @@ import socket
 import uuid
 import warnings
 from array import array
+from collections import namedtuple
 from time import monotonic
 
 from vine import ensure_promise
@@ -58,6 +59,8 @@ NEGOTIATE_CAPABILITIES = {
     'connection.blocked': True,
     'authentication_failure_close': True,
 }
+
+HeartbeatDeadline = namedtuple('HeartbeatDeadline', ('send', 'receive'))
 
 
 class Connection(AbstractChannel):
@@ -197,7 +200,7 @@ class Connection(AbstractChannel):
                  on_unblocked=None, confirm_publish=False,
                  on_tune_ok=None, read_timeout=None, write_timeout=None,
                  socket_settings=None, frame_handler=frame_handler,
-                 frame_writer=frame_writer, **kwargs):
+                 frame_writer=frame_writer, clock=None, **kwargs):
         self._connection_id = uuid.uuid4().hex
         channel_max = channel_max or 65535
         frame_max = frame_max or 131072
@@ -241,6 +244,7 @@ class Connection(AbstractChannel):
 
         self.frame_handler_cls = frame_handler
         self.frame_writer_cls = frame_writer
+        self.clock = clock
 
         self._handshake_complete = False
 
@@ -251,6 +255,7 @@ class Connection(AbstractChannel):
         self._frame_writer = None
         self._on_inbound_frame = None
         self._transport = None
+        self._reset_heartbeat_state()
 
         # Properties set in the Tune method
         self.channel_max = channel_max
@@ -315,6 +320,8 @@ class Connection(AbstractChannel):
         #
         if self.connected:
             return callback() if callback else None
+        self._handshake_complete = False
+        self._reset_heartbeat_state()
         try:
             self.transport = self.Transport(
                 self.host, self.connect_timeout, self.ssl,
@@ -424,6 +431,7 @@ class Connection(AbstractChannel):
 
     def _on_tune(self, channel_max, frame_max, server_heartbeat, argsig='BlB'):
         client_heartbeat = self.client_heartbeat or 0
+        previous_heartbeat = self.heartbeat
         self.channel_max = channel_max or self.channel_max
         self.frame_max = frame_max or self.frame_max
         self.server_heartbeat = server_heartbeat or 0
@@ -439,6 +447,15 @@ class Connection(AbstractChannel):
         if not self.client_heartbeat:
             self.heartbeat = 0
 
+        if self.heartbeat:
+            if self.heartbeat != previous_heartbeat:
+                self._start_heartbeat_interval()
+        else:
+            self.last_heartbeat_sent = 0
+            self.last_heartbeat_received = 0
+            self.prev_sent = None
+            self.prev_recv = None
+
         self.send_method(
             spec.Connection.TuneOk, argsig,
             (self.channel_max, self.frame_max, self.heartbeat),
@@ -451,6 +468,8 @@ class Connection(AbstractChannel):
         )
 
     def _on_open_ok(self):
+        if self.heartbeat:
+            self._start_heartbeat_interval()
         self._handshake_complete = True
         self.on_open(self)
 
@@ -481,6 +500,29 @@ class Connection(AbstractChannel):
             for ch in channels:
                 ch.collect()
         self._transport = self.connection = self.channels = None
+        self._reset_heartbeat_state()
+
+    def _reset_heartbeat_state(self):
+        self.heartbeat = None
+        self.server_heartbeat = None
+        self.last_heartbeat_sent = 0
+        self.last_heartbeat_received = 0
+        self.bytes_sent = 0
+        self.bytes_recv = 0
+        self.prev_sent = None
+        self.prev_recv = None
+
+    def _start_heartbeat_interval(self):
+        now = self._monotonic()
+        self.last_heartbeat_sent = now
+        self.last_heartbeat_received = now
+        self.prev_sent = self.bytes_sent
+        self.prev_recv = self.bytes_recv
+
+    def _monotonic(self):
+        if self.clock is None:
+            return monotonic()
+        return self.clock()
 
     def _get_free_channel_id(self):
         # Cast to a set for fast lookups, and keep stored as an array for lower memory usage.
@@ -712,7 +754,7 @@ class Connection(AbstractChannel):
     def send_heartbeat(self):
         self.frame_writer(8, 0, None, None, None)
 
-    def heartbeat_tick(self, rate=2):
+    def heartbeat_tick(self, rate=2, now=None):
         """Send heartbeat packets if necessary.
 
         Raises:
@@ -726,6 +768,8 @@ class Connection(AbstractChannel):
         Keyword Arguments:
             rate (int): Number of heartbeat frames to send during the heartbeat
                         timeout
+            now (float): Current monotonic time. The connection clock is used
+                         when omitted.
         """
         AMQP_HEARTBEAT_LOGGER.debug('heartbeat_tick : for connection %s',
                                     self._connection_id)
@@ -736,15 +780,17 @@ class Connection(AbstractChannel):
         if rate <= 0:
             rate = 2
 
+        if now is None:
+            now = self._monotonic()
+
         # treat actual data exchange in either direction as a heartbeat
         sent_now = self.bytes_sent
         recv_now = self.bytes_recv
         if self.prev_sent is None or self.prev_sent != sent_now:
-            self.last_heartbeat_sent = monotonic()
+            self.last_heartbeat_sent = now
         if self.prev_recv is None or self.prev_recv != recv_now:
-            self.last_heartbeat_received = monotonic()
+            self.last_heartbeat_received = now
 
-        now = monotonic()
         AMQP_HEARTBEAT_LOGGER.debug(
             'heartbeat_tick : Prev sent/recv: %s/%s, '
             'now - %s/%s, monotonic - %s, '
@@ -759,21 +805,42 @@ class Connection(AbstractChannel):
 
         self.prev_sent, self.prev_recv = sent_now, recv_now
 
+        deadlines = self._next_heartbeat_deadlines(rate)
+
         # send a heartbeat if it's time to do so
-        if now > self.last_heartbeat_sent + self.heartbeat / rate:
+        if now >= deadlines.send:
             AMQP_HEARTBEAT_LOGGER.debug(
                 'heartbeat_tick: sending heartbeat for connection %s',
                 self._connection_id)
             self.send_heartbeat()
-            self.last_heartbeat_sent = monotonic()
+            self.last_heartbeat_sent = now
+            self.prev_sent = self.bytes_sent
 
-        # if we've missed two intervals' heartbeats, fail; this gives the
-        # server enough time to send heartbeats a little late
-        two_heartbeats = 2 * self.heartbeat
-        two_heartbeats_interval = self.last_heartbeat_received + two_heartbeats
-        heartbeats_missed = two_heartbeats_interval < monotonic()
-        if self.last_heartbeat_received and heartbeats_missed:
+        if deadlines.receive is not None and now >= deadlines.receive:
             raise ConnectionForced('Too many heartbeats missed')
+
+    def _next_heartbeat_deadlines(self, rate=2):
+        if not self.heartbeat:
+            return HeartbeatDeadline(None, None)
+
+        if rate <= 0:
+            rate = 2
+
+        send_deadline = self.last_heartbeat_sent + self.heartbeat / rate
+        receive_deadline = (
+            self.last_heartbeat_received + 2 * self.heartbeat
+            if self.last_heartbeat_received else None
+        )
+        return HeartbeatDeadline(send_deadline, receive_deadline)
+
+    @property
+    def next_heartbeat_deadline(self):
+        """Return absolute send and receive heartbeat deadlines.
+
+        Reading the deadlines does not record activity or advance the
+        connection's heartbeat state.
+        """
+        return self._next_heartbeat_deadlines()
 
     @property
     def sock(self):

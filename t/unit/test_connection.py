@@ -8,7 +8,7 @@ import time
 
 from amqp import Connection, spec
 from amqp.connection import SSLError
-from amqp.exceptions import (ConnectionError, NotFound,
+from amqp.exceptions import (ConnectionError, ConnectionForced, NotFound,
                              RecoverableConnectionError, ResourceError)
 from amqp.sasl import AMQPLAIN, EXTERNAL, GSSAPI, PLAIN, SASL
 from amqp.transport import TCPTransport
@@ -16,10 +16,19 @@ from amqp.transport import TCPTransport
 from t.mocks import ContextMock
 
 
+class FakeClock:
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
 class test_Connection:
 
     @pytest.fixture(autouse=True)
     def setup_conn(self):
+        self.clock = FakeClock(100.0)
         self.frame_handler = Mock(name='frame_handler')
         self.frame_writer = Mock(name='frame_writer_cls')
         self.conn = Connection(
@@ -32,6 +41,20 @@ class test_Connection:
         self.conn.transport = self.conn.Transport.return_value
         self.conn.send_method = Mock(name='send_method')
         self.conn.frame_writer = Mock(name='frame_writer')
+
+    def create_connection(self, heartbeat=4):
+        conn = Connection(
+            heartbeat=heartbeat,
+            frame_handler=self.frame_handler,
+            frame_writer=self.frame_writer,
+            authentication=AMQPLAIN('foo', 'bar'),
+            clock=self.clock,
+        )
+        conn.Transport = Mock(name='Transport')
+        conn.transport = conn.Transport.return_value
+        conn.send_method = Mock(name='send_method')
+        conn.frame_writer = Mock(name='frame_writer')
+        return conn
 
     def test_sasl_authentication(self):
         authentication = SASL()
@@ -502,6 +525,118 @@ class test_Connection:
     def test_heartbeat_tick__no_heartbeat(self):
         self.conn.heartbeat = 0
         self.conn.heartbeat_tick()
+        assert self.conn.next_heartbeat_deadline == (None, None)
+
+    def test_heartbeat_deadline_after_negotiation(self):
+        conn = self.create_connection()
+
+        assert conn.next_heartbeat_deadline == (None, None)
+
+        conn._on_tune(0, 0, 4)
+
+        assert conn.next_heartbeat_deadline == (102.0, 108.0)
+        assert conn.last_heartbeat_sent == 100.0
+        assert conn.last_heartbeat_received == 100.0
+
+        assert conn.next_heartbeat_deadline == (102.0, 108.0)
+        assert conn.last_heartbeat_sent == 100.0
+        assert conn.last_heartbeat_received == 100.0
+
+    def test_heartbeat_tick_advances_to_deadlines(self):
+        conn = self.create_connection()
+        conn._on_tune(0, 0, 4)
+
+        def send_heartbeat():
+            conn.frame_writer(8, 0, None, None, None)
+            conn.bytes_sent += 1
+
+        conn.send_heartbeat = send_heartbeat
+
+        conn.heartbeat_tick(now=101.9)
+        conn.frame_writer.assert_not_called()
+        assert conn.next_heartbeat_deadline == (102.0, 108.0)
+
+        conn.heartbeat_tick(now=102.0)
+        conn.frame_writer.assert_called_once_with(8, 0, None, None, None)
+        assert conn.prev_sent == 1
+        assert conn.next_heartbeat_deadline == (104.0, 108.0)
+
+        conn.heartbeat_tick(now=102.5)
+        assert conn.frame_writer.call_count == 1
+
+        with pytest.raises(ConnectionForced):
+            conn.heartbeat_tick(now=108.0)
+
+    def test_heartbeat_tick_uses_data_activity(self):
+        conn = self.create_connection()
+        conn._on_tune(0, 0, 4)
+
+        conn.bytes_sent = 1
+        conn.bytes_recv = 1
+        conn.heartbeat_tick(now=102.0)
+
+        conn.frame_writer.assert_not_called()
+        assert conn.last_heartbeat_sent == 102.0
+        assert conn.last_heartbeat_received == 102.0
+        assert conn.next_heartbeat_deadline == (104.0, 110.0)
+
+    def test_heartbeat_tick_failed_send_does_not_postpone_deadline(self):
+        conn = self.create_connection()
+        conn._on_tune(0, 0, 4)
+        conn.frame_writer.side_effect = socket.error
+
+        with pytest.raises(socket.error):
+            conn.heartbeat_tick(now=102.0)
+
+        assert conn.last_heartbeat_sent == 100.0
+        assert conn.next_heartbeat_deadline.send == 102.0
+
+    def test_heartbeat_negotiation_change_resets_deadline(self):
+        conn = self.create_connection()
+        conn._on_tune(0, 0, 4)
+        assert conn.next_heartbeat_deadline == (102.0, 108.0)
+
+        self.clock.value = 105.0
+        conn.client_heartbeat = 6
+        conn._on_tune(0, 0, 6)
+
+        assert conn.heartbeat == 6
+        assert conn.next_heartbeat_deadline == (108.0, 117.0)
+
+    def test_heartbeat_deadline_cleared_when_disabled(self):
+        conn = self.create_connection()
+        conn._on_tune(0, 0, 4)
+        assert conn.next_heartbeat_deadline == (102.0, 108.0)
+
+        conn.client_heartbeat = 0
+        conn._on_tune(0, 0, 4)
+
+        assert conn.heartbeat == 0
+        assert conn.next_heartbeat_deadline == (None, None)
+        assert conn.last_heartbeat_sent == 0
+        assert conn.last_heartbeat_received == 0
+
+    def test_reconnect_does_not_use_old_heartbeat_deadline(self):
+        self.conn.clock = self.clock
+        self.conn.transport.connected = False
+        self.conn.drain_events = Mock(
+            name='drain_events',
+            side_effect=lambda *args, **kwargs: self.conn._on_open_ok(),
+        )
+        self.conn.heartbeat = 4
+        self.conn.last_heartbeat_sent = 0
+        self.conn.last_heartbeat_received = 0
+
+        self.clock.value = 100.0
+        self.conn.connect()
+        assert self.conn.next_heartbeat_deadline == (None, None)
+
+        self.clock.value = 105.0
+        self.conn.client_heartbeat = 4
+        self.conn._on_tune(0, 0, 4)
+        self.conn._on_open_ok()
+
+        assert self.conn.next_heartbeat_deadline == (107.0, 113.0)
 
     def test_heartbeat_tick(self):
         self.conn.heartbeat = 3
