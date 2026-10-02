@@ -1,16 +1,23 @@
 import re
 import socket
 import warnings
+from collections import deque
+from contextlib import contextmanager
+from struct import pack, unpack_from
 from unittest.mock import Mock, call, patch
 
 import pytest
 import time
 
 from amqp import Connection, spec
+from amqp.basic_message import Message
+from amqp.channel import Channel
 from amqp.connection import SSLError
-from amqp.exceptions import (ConnectionError, NotFound,
+from amqp.exceptions import (Blocked, ConnectionError, NotFound,
                              RecoverableConnectionError, ResourceError)
+from amqp.method_framing import frame_handler, frame_writer
 from amqp.sasl import AMQPLAIN, EXTERNAL, GSSAPI, PLAIN, SASL
+from amqp.serialization import dumps
 from amqp.transport import TCPTransport
 
 from t.mocks import ContextMock
@@ -581,3 +588,305 @@ class test_Connection:
             ),
             repr(c)
         )
+
+
+class ScriptedTransport:
+    """Fake transport recording written frames and scripting inbound ones."""
+
+    def __init__(self):
+        self.written = []
+        self.inbound = deque()
+        self.connected = True
+        self.on_pop = None
+
+    def write(self, data):
+        self.written.append(bytes(data))
+
+    def read_frame(self):
+        if not self.inbound:
+            raise socket.timeout('no scripted inbound frame')
+        frame = self.inbound.popleft()
+        if self.on_pop is not None:
+            self.on_pop(frame)
+        return frame
+
+    @contextmanager
+    def having_timeout(self, timeout):
+        yield
+
+    def close(self):
+        self.connected = False
+
+
+def parse_frames(chunks):
+    """Parse recorded socket writes into (type, channel, payload) frames."""
+    buf = b''.join(chunks)
+    frames = []
+    while buf:
+        frame_type, channel, size = unpack_from('>BHI', buf, 0)
+        payload = bytes(buf[7:7 + size])
+        assert buf[7 + size] == 0xce
+        frames.append((frame_type, channel, payload))
+        buf = buf[7 + size + 1:]
+    return frames
+
+
+def method_payload(sig, args=b''):
+    return pack('>HH', *sig) + args
+
+
+def method_frame(channel, sig, args=b''):
+    return (1, channel, method_payload(sig, args))
+
+
+class test_ConnectionBlockedPublish:
+    """Connection-level publish policy for Connection.Blocked.
+
+    These tests inject Blocked/Unblocked/Blocked into a real Connection
+    wired to a recording transport, and assert on the frames actually
+    written to the socket.
+    """
+
+    def make_conn(self, blocked_capability=True, **kwargs):
+        conn = Connection(authentication=AMQPLAIN('foo', 'bar'), **kwargs)
+        transport = ScriptedTransport()
+        conn.transport = transport
+        conn.frame_writer = frame_writer(conn, transport)
+        conn.on_inbound_frame = frame_handler(conn, conn.on_inbound_method)
+        if blocked_capability:
+            conn.client_properties['capabilities'] = {
+                'connection.blocked': True,
+            }
+        return conn, transport
+
+    def open_channel(self, conn, channel_id):
+        return Channel(conn, channel_id)
+
+    def inject_method(self, conn, channel, sig, args=b''):
+        conn.on_inbound_frame(method_frame(channel, sig, args))
+
+    def publish_frames(self, transport):
+        return [f for f in parse_frames(transport.written)
+                if f[2][:4] == method_payload(spec.Basic.Publish)]
+
+    def test_invalid_policy_rejected(self):
+        with pytest.raises(ValueError):
+            Connection(blocked_publish_policy='explode')
+
+    def test_reject_policy_raises_and_writes_nothing(self):
+        conn, transport = self.make_conn()
+        ch = self.open_channel(conn, 1)
+
+        self.inject_method(conn, 0, spec.Connection.Blocked)
+        assert conn._blocked
+
+        with pytest.raises(Blocked):
+            ch.basic_publish(Message(body=b'm1'), 'ex', 'rk')
+        # not a single frame was written for the rejected publish
+        assert transport.written == []
+
+        # heartbeats and close frames still flow while blocked
+        conn.send_heartbeat()
+        conn.send_method(
+            spec.Connection.Close, 'BsBB', (200, 'bye', 0, 0))
+        frames = parse_frames(transport.written)
+        assert [f[0] for f in frames] == [8, 1]
+        assert frames[1][2][:4] == method_payload(spec.Connection.Close)
+
+        # after Unblocked publishing works again
+        self.inject_method(conn, 0, spec.Connection.Unblocked)
+        assert not conn._blocked
+        ch.basic_publish(Message(body=b'm1'), 'ex', 'rk')
+        assert len(self.publish_frames(transport)) == 1
+
+    def test_queue_policy_orders_channels_and_control_frames_flow(self):
+        conn, transport = self.make_conn(blocked_publish_policy='queue')
+        ch1 = self.open_channel(conn, 1)
+        ch2 = self.open_channel(conn, 2)
+        acks = []
+        ch1.events['basic_ack'].add(
+            lambda tag, multiple: acks.append((tag, multiple)))
+
+        self.inject_method(conn, 0, spec.Connection.Blocked)
+
+        # interleaved publishes on two channels are queued, not written
+        p1 = ch1.basic_publish(Message(body=b'm1'), 'ex', 'rk')
+        p2 = ch2.basic_publish(Message(body=b'm2'), 'ex', 'rk')
+        p3 = ch1.basic_publish(Message(body=b'm3'), 'ex', 'rk')
+        assert transport.written == []
+        assert conn._blocked_queue_bytes > 0
+
+        # heartbeats, confirms and close frames keep flowing while blocked
+        conn.send_heartbeat()
+        self.inject_method(
+            conn, 1, spec.Basic.Ack, dumps('Lb', (7, False)))
+        conn.send_method(
+            spec.Connection.Close, 'BsBB', (200, 'bye', 0, 0))
+        assert acks == [(7, False)]
+        frames = parse_frames(transport.written)
+        assert [f[0] for f in frames] == [8, 1]
+        assert frames[1][2][:4] == method_payload(spec.Connection.Close)
+        assert self.publish_frames(transport) == []
+
+        # Unblocked: the queue drains in exact acceptance order,
+        # preserving each channel's publish sequence.
+        transport.written.clear()
+        self.inject_method(conn, 0, spec.Connection.Unblocked)
+        frames = parse_frames(transport.written)
+        bodies = [payload for t, ch, payload in frames if t == 3]
+        channels = [ch for t, ch, payload in frames if t == 1]
+        assert bodies == [b'm1', b'm2', b'm3']
+        assert channels == [1, 2, 1]
+        assert all(p.ready for p in (p1, p2, p3))
+        assert conn._blocked_queue_bytes == 0
+
+        # a second Blocked stops publishing again...
+        self.inject_method(conn, 0, spec.Connection.Blocked)
+        transport.written.clear()
+        ch1.basic_publish(Message(body=b'm4'), 'ex', 'rk')
+        assert transport.written == []
+
+        # ...and the second Unblocked flushes what was queued meanwhile
+        self.inject_method(conn, 0, spec.Connection.Unblocked)
+        frames = parse_frames(transport.written)
+        bodies = [payload for t, ch, payload in frames if t == 3]
+        assert bodies == [b'm4']
+
+    def test_drain_stops_when_reblocked_mid_flush(self):
+        conn, transport = self.make_conn(blocked_publish_policy='queue')
+        ch = self.open_channel(conn, 1)
+
+        self.inject_method(conn, 0, spec.Connection.Blocked)
+        ch.basic_publish(Message(body=b'm1'), 'ex', 'rk')
+        ch.basic_publish(Message(body=b'm2'), 'ex', 'rk')
+
+        # the broker blocks the connection again while the queue is
+        # being flushed: draining must stop immediately
+        real_writer = conn.frame_writer
+
+        def reblocking_writer(type_, channel, sig, args, content):
+            real_writer(type_, channel, sig, args, content)
+            conn._blocked = True
+        conn.frame_writer = reblocking_writer
+
+        self.inject_method(conn, 0, spec.Connection.Unblocked)
+        bodies = [payload for t, c, payload in parse_frames(
+            transport.written) if t == 3]
+        assert bodies == [b'm1']
+        assert len(conn._blocked_queue) == 1
+
+        # the remainder is flushed by the next Unblocked
+        conn.frame_writer = real_writer
+        self.inject_method(conn, 0, spec.Connection.Unblocked)
+        bodies = [payload for t, c, payload in parse_frames(
+            transport.written) if t == 3]
+        assert bodies == [b'm1', b'm2']
+        assert not conn._blocked_queue
+
+    def test_queue_budget_exceeded_rejects_without_fake_confirm(self):
+        conn, transport = self.make_conn(
+            blocked_publish_policy='queue',
+            blocked_queue_max_bytes=128,
+            confirm_publish=True,
+        )
+        ch = self.open_channel(conn, 1)
+        ch._confirm_selected = True
+        ch.wait = Mock(name='wait')
+
+        self.inject_method(conn, 0, spec.Connection.Blocked)
+
+        # first publish fits the byte budget and is queued
+        ch.basic_publish(Message(body=b'x' * 32), 'ex', 'rk')
+        assert conn._blocked_queue_bytes > 0
+        ch.wait.reset_mock()
+
+        # second publish exceeds the budget: rejected with Blocked,
+        # and no confirm receipt is fabricated for it
+        with pytest.raises(Blocked):
+            ch.basic_publish(Message(body=b'x' * 32), 'ex', 'rk')
+        ch.wait.assert_not_called()
+        assert transport.written == []
+
+        # only the first (queued) publish is written after Unblocked
+        self.inject_method(conn, 0, spec.Connection.Unblocked)
+        bodies = [payload for t, ch_, payload in parse_frames(
+            transport.written) if t == 3]
+        assert bodies == [b'x' * 32]
+
+    def test_confirm_publish_waits_through_blocked_period(self):
+        conn, transport = self.make_conn(
+            blocked_capability=False,
+            blocked_publish_policy='queue',
+        )
+        ch = self.open_channel(conn, 1)
+        ch._confirm_selected = True
+
+        self.inject_method(conn, 0, spec.Connection.Blocked)
+
+        # broker unblocks, then confirms delivery tag 1
+        transport.inbound.append(method_frame(0, spec.Connection.Unblocked))
+        transport.inbound.append(
+            method_frame(1, spec.Basic.Ack, dumps('Lb', (1, False))))
+
+        # nothing may be written before the Unblocked frame is read
+        written_at_unblock = []
+
+        def on_pop(frame):
+            if frame[2][:4] == method_payload(spec.Connection.Unblocked):
+                written_at_unblock.extend(transport.written)
+        transport.on_pop = on_pop
+
+        ch.basic_publish_confirm(Message(body=b'hello'), 'ex', 'rk')
+
+        assert written_at_unblock == []
+        bodies = [payload for t, ch_, payload in parse_frames(
+            transport.written) if t == 3]
+        assert bodies == [b'hello']
+
+    def test_close_fails_queued_publishes(self):
+        conn, transport = self.make_conn(blocked_publish_policy='queue')
+        ch = self.open_channel(conn, 1)
+
+        self.inject_method(conn, 0, spec.Connection.Blocked)
+        p1 = ch.basic_publish(Message(body=b'm1'), 'ex', 'rk')
+        p2 = ch.basic_publish(Message(body=b'm2'), 'ex', 'rk')
+
+        conn.collect()
+
+        # queued publishes are handed back as explicitly failed
+        for p in (p1, p2):
+            assert p.failed
+            assert isinstance(p.reason, RecoverableConnectionError)
+        assert not conn._blocked_queue
+        assert conn._blocked_queue_bytes == 0
+        assert transport.written == []
+
+    def test_reconnect_fails_leftover_queue_instead_of_replaying(self):
+        conn, transport = self.make_conn(blocked_publish_policy='queue')
+        ch = self.open_channel(conn, 1)
+
+        self.inject_method(conn, 0, spec.Connection.Blocked)
+        p = ch.basic_publish(Message(body=b'm1'), 'ex', 'rk')
+
+        # the old transport is gone; a reconnect must fail the queued
+        # publish, never silently republish it on the new connection
+        transport.connected = False
+        new_transport = Mock(name='new_transport')
+        new_transport.having_timeout = ContextMock()
+        new_transport.read_frame.side_effect = OSError('no broker')
+        conn.Transport = Mock(name='Transport', return_value=new_transport)
+        with pytest.raises(OSError):
+            conn.connect()
+
+        assert p.failed
+        assert isinstance(p.reason, RecoverableConnectionError)
+        assert not conn._blocked
+        new_transport.write.assert_not_called()
+
+    def test_unblocked_with_empty_queue(self):
+        conn, transport = self.make_conn(blocked_publish_policy='queue')
+        conn.on_unblocked = Mock(name='on_unblocked')
+        self.inject_method(conn, 0, spec.Connection.Blocked)
+        self.inject_method(conn, 0, spec.Connection.Unblocked)
+        conn.on_unblocked.assert_called_once_with()
+        assert transport.written == []

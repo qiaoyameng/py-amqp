@@ -21,6 +21,7 @@ class test_Channel:
         self.conn = MagicMock(name='connection')
         self.conn.is_closing = False
         self.conn.channels = {}
+        self.conn._blocked = False
         self.conn._get_free_channel_id.return_value = 2
         self.c = Channel(self.conn, 1)
         self.c.send_method = Mock(name='send_method')
@@ -507,6 +508,40 @@ class test_Channel:
         }
         self.c._basic_publish('msg', 'ex', 'rkey')
         self.conn.drain_events.assert_not_called()
+        self.c.send_method.assert_called_once_with(
+            spec.Basic.Publish, 'Bssbb',
+            (0, 'ex', 'rkey', False, False), 'msg',
+        )
+
+    def test_basic_publish_delegates_when_connection_blocked(self):
+        # When the broker has blocked the connection, the publish is
+        # handed to the connection-level blocked publish policy and
+        # nothing is written to the socket.
+        self.conn._blocked = True
+        self.conn._publish_while_blocked.return_value = 'handled'
+        ret = self.c._basic_publish('msg', 'ex', 'rkey')
+        assert ret == 'handled'
+        self.conn._publish_while_blocked.assert_called_once_with(
+            self.c, spec.Basic.Publish, 'Bssbb',
+            (0, 'ex', 'rkey', False, False), 'msg',
+        )
+        self.c.send_method.assert_not_called()
+
+    def test_basic_publish_rejected_when_connection_blocked(self):
+        # The reject policy surfaces as amqp.exceptions.Blocked and
+        # no frame is written.
+        from amqp.exceptions import Blocked
+        self.conn._blocked = True
+        self.conn._publish_while_blocked.side_effect = Blocked('blocked')
+        with pytest.raises(Blocked):
+            self.c._basic_publish('msg', 'ex', 'rkey')
+        self.c.send_method.assert_not_called()
+
+    def test_basic_publish_writes_when_connection_unblocked(self):
+        # A connection that is not blocked publishes normally.
+        self.conn._blocked = False
+        self.c._basic_publish('msg', 'ex', 'rkey')
+        self.conn._publish_while_blocked.assert_not_called()
         self.c.send_method.assert_called_once_with(
             spec.Basic.Publish, 'Bssbb',
             (0, 'ex', 'rkey', False, False), 'msg',

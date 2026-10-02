@@ -1792,6 +1792,14 @@ class Channel(AbstractChannel):
             except socket.timeout:
                 pass
 
+        if self.connection._blocked:
+            # The broker has blocked this connection: apply the
+            # connection-level publish policy (reject or bounded queue)
+            # instead of writing the message to the socket.
+            return self.connection._publish_while_blocked(
+                self, spec.Basic.Publish, argsig,
+                (0, exchange, routing_key, mandatory, immediate), msg)
+
         try:
             with self.connection.transport.having_timeout(timeout):
                 return self.send_method(

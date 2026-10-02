@@ -6,18 +6,20 @@ import socket
 import uuid
 import warnings
 from array import array
+from collections import deque, namedtuple
 from time import monotonic
 
-from vine import ensure_promise
+from vine import ensure_promise, promise
 
 from . import __version__, sasl, spec
 from .abstract_channel import AbstractChannel
 from .channel import Channel
-from .exceptions import (AMQPDeprecationWarning, ChannelError, ConnectionError,
-                         ConnectionForced, MessageNacked, RecoverableChannelError,
-                         RecoverableConnectionError, ResourceError,
-                         error_for_code)
-from .method_framing import frame_handler, frame_writer
+from .exceptions import (AMQPDeprecationWarning, Blocked, ChannelError,
+                         ConnectionError, ConnectionForced, MessageNacked,
+                         RecoverableChannelError, RecoverableConnectionError,
+                         ResourceError, error_for_code)
+from .method_framing import FRAME_OVERHEAD, frame_handler, frame_writer
+from .serialization import dumps
 from .transport import Transport
 
 try:
@@ -58,6 +60,26 @@ NEGOTIATE_CAPABILITIES = {
     'connection.blocked': True,
     'authentication_failure_close': True,
 }
+
+#: Reject publishes immediately with :class:`~amqp.exceptions.Blocked`
+#: while the broker has blocked the connection.
+BLOCKED_PUBLISH_REJECT = 'reject'
+
+#: Queue publishes while the broker has blocked the connection,
+#: bounded by a byte budget, and write them out once unblocked.
+BLOCKED_PUBLISH_QUEUE = 'queue'
+
+#: Valid values for the ``blocked_publish_policy`` connection parameter.
+BLOCKED_PUBLISH_POLICIES = (BLOCKED_PUBLISH_REJECT, BLOCKED_PUBLISH_QUEUE)
+
+#: Default byte budget for publishes queued while the connection is
+#: blocked (used with ``blocked_publish_policy='queue'``).
+DEFAULT_BLOCKED_QUEUE_MAX_BYTES = 16 * 1024 * 1024
+
+#: A publish captured while the connection was blocked by the broker.
+_QueuedPublish = namedtuple('_QueuedPublish', (
+    'channel_id', 'sig', 'args', 'content', 'size', 'promise',
+))
 
 
 class Connection(AbstractChannel):
@@ -105,6 +127,24 @@ class Connection(AbstractChannel):
     When "confirm_publish" is set to True, the channel is put to
     confirm mode. In this mode, each published message is
     confirmed using Publisher confirms RabbitMQ extension.
+
+    When the broker blocks the connection (the ``connection.blocked``
+    RabbitMQ extension), publishing is governed by the
+    ``blocked_publish_policy`` parameter:
+
+    - ``'reject'`` (default): :meth:`~amqp.Channel.basic_publish`
+      raises :class:`~amqp.exceptions.Blocked` immediately.
+    - ``'queue'``: publishes are queued client-side, bounded by
+      ``blocked_queue_max_bytes`` bytes, and written out in the order
+      they were accepted once the broker unblocks the connection.
+      Publishes exceeding the byte budget are rejected with
+      :class:`~amqp.exceptions.Blocked`.  If the connection closes
+      while publishes are still queued, every queued publish is failed
+      explicitly; queued publishes are never silently replayed on a
+      new connection.
+
+    Heartbeats, publisher confirms and connection/channel close frames
+    are not affected by the policy and keep flowing while blocked.
     """
 
     Channel = Channel
@@ -195,6 +235,8 @@ class Connection(AbstractChannel):
                  ssl=False, connect_timeout=None, channel_max=None,
                  frame_max=None, heartbeat=0, on_open=None, on_blocked=None,
                  on_unblocked=None, confirm_publish=False,
+                 blocked_publish_policy=BLOCKED_PUBLISH_REJECT,
+                 blocked_queue_max_bytes=DEFAULT_BLOCKED_QUEUE_MAX_BYTES,
                  on_tune_ok=None, read_timeout=None, write_timeout=None,
                  socket_settings=None, frame_handler=frame_handler,
                  frame_writer=frame_writer, **kwargs):
@@ -268,6 +310,19 @@ class Connection(AbstractChannel):
         self.on_unblocked = on_unblocked
         self.on_open = ensure_promise(on_open)
 
+        if blocked_publish_policy not in BLOCKED_PUBLISH_POLICIES:
+            raise ValueError(
+                'blocked_publish_policy must be one of {!r}'.format(
+                    BLOCKED_PUBLISH_POLICIES))
+        self.blocked_publish_policy = blocked_publish_policy
+        self.blocked_queue_max_bytes = blocked_queue_max_bytes
+
+        # State for the connection.blocked RabbitMQ extension.
+        self._blocked = False
+        self._blocked_reason = None
+        self._blocked_queue = deque()
+        self._blocked_queue_bytes = 0
+
         self._used_channel_ids = array('H')
 
         # Properties set in the Start method
@@ -315,6 +370,13 @@ class Connection(AbstractChannel):
         #
         if self.connected:
             return callback() if callback else None
+        # A (re)connect must never silently replay publishes that were
+        # queued while a previous incarnation of this connection was
+        # blocked: fail them explicitly instead.
+        self._fail_blocked_queue(RecoverableConnectionError(
+            'connection re-established while publishes were still queued'))
+        self._blocked = False
+        self._blocked_reason = None
         try:
             self.transport = self.Transport(
                 self.host, self.connect_timeout, self.ssl,
@@ -469,6 +531,13 @@ class Connection(AbstractChannel):
     def collect(self):
         if self._transport:
             self._transport.close()
+
+        # Publishes queued while the connection was blocked are handed
+        # back to the caller as explicitly failed; they are never
+        # republished on another connection behind the caller's back.
+        self._fail_blocked_queue(RecoverableConnectionError(
+            'connection closed while publishes were still queued '
+            '(connection blocked)'))
 
         if self.channels:
             # Copy all the channels except self since the channels
@@ -702,12 +771,76 @@ class Connection(AbstractChannel):
             This is an RabbitMQ Extension.
         """
         reason = 'connection blocked, see broker logs'
+        self._blocked = True
+        self._blocked_reason = reason
         if self.on_blocked:
             return self.on_blocked(reason)
 
     def _on_unblocked(self):
+        self._blocked = False
+        self._blocked_reason = None
+        self._drain_blocked_queue()
         if self.on_unblocked:
             return self.on_unblocked()
+
+    def _publish_while_blocked(self, channel, sig, format, args, content):
+        """Handle a publish attempted while the connection is blocked.
+
+        Depending on :attr:`blocked_publish_policy` the publish is
+        either rejected by raising :class:`~amqp.exceptions.Blocked`,
+        or queued (bounded by :attr:`blocked_queue_max_bytes`) until
+        the broker unblocks the connection.
+        """
+        if self.blocked_publish_policy == BLOCKED_PUBLISH_QUEUE:
+            return self._queue_publish(channel, sig, format, args, content)
+        raise Blocked(self._blocked_reason or 'connection blocked by broker')
+
+    def _queue_publish(self, channel, sig, format, args, content):
+        args = dumps(format, args) if format else b''
+        body = getattr(content, 'body', None) or b''
+        size = len(args) + len(body) + FRAME_OVERHEAD
+        if self._blocked_queue_bytes + size > self.blocked_queue_max_bytes:
+            raise Blocked(
+                'connection blocked and the blocked publish queue is '
+                'full: {} bytes would exceed the {} byte budget'.format(
+                    self._blocked_queue_bytes + size,
+                    self.blocked_queue_max_bytes))
+        p = promise()
+        self._blocked_queue.append(_QueuedPublish(
+            channel.channel_id, sig, args, content, size, p))
+        self._blocked_queue_bytes += size
+        return p
+
+    def _drain_blocked_queue(self):
+        """Write out publishes queued while the connection was blocked.
+
+        Queued publishes are written in the exact order they were
+        accepted, so the per-channel publish sequence the broker
+        observes is identical to the caller's publish order.  Draining
+        stops immediately if the broker blocks the connection again.
+        """
+        queue = self._blocked_queue
+        while queue and not self._blocked:
+            entry = queue[0]
+            try:
+                self.frame_writer(1, entry.channel_id, entry.sig,
+                                  entry.args, entry.content)
+            except Exception as exc:
+                self._fail_blocked_queue(exc)
+                raise
+            queue.popleft()
+            self._blocked_queue_bytes -= entry.size
+            entry.promise()
+
+    def _fail_blocked_queue(self, exc):
+        """Fail every queued publish with *exc*, emptying the queue."""
+        queue = self._blocked_queue
+        if not queue:
+            return
+        self._blocked_queue = deque()
+        self._blocked_queue_bytes = 0
+        while queue:
+            queue.popleft().promise.throw(exc, propagate=False)
 
     def send_heartbeat(self):
         self.frame_writer(8, 0, None, None, None)
