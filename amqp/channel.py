@@ -10,12 +10,15 @@ from vine import ensure_promise
 
 from . import spec
 from .abstract_channel import AbstractChannel
+from .delivery import (DeliveryAlreadySettled, DeliveryHandle,
+                       DeliveryHandleInvalid)
 from .exceptions import (ChannelError, ConsumerCancelled, MessageNacked,
                          RecoverableConnectionError,
                          error_for_code)
 from .protocol import queue_declare_ok_t
 
-__all__ = ('Channel',)
+__all__ = ('Channel', 'DeliveryHandle',
+           'DeliveryAlreadySettled', 'DeliveryHandleInvalid')
 
 AMQP_LOGGER = logging.getLogger('amqp')
 
@@ -113,6 +116,11 @@ class Channel(AbstractChannel):
         self.auto_decode = auto_decode
         self.events = defaultdict(set)
         self.no_ack_consumers = set()
+        # Consumers that opted in to receiving DeliveryHandle objects.
+        self.delivery_handle_consumers = set()
+        # delivery_tag -> DeliveryHandle for every unresolved delivery
+        # (still in the application or ack-pending in a coalesced prefix).
+        self._deliveries = {}
 
         self.on_open = ensure_promise(on_open)
 
@@ -171,10 +179,77 @@ class Channel(AbstractChannel):
         self.cancel_callbacks.clear()
         self.events.clear()
         self.no_ack_consumers.clear()
+        self.delivery_handle_consumers.clear()
+        self._invalidate_all_deliveries()
 
     def _do_revive(self):
+        # A recovered channel starts a new delivery-tag sequence, so any
+        # handle from before the server-issued close is stale.
+        self._invalidate_all_deliveries()
         self.is_open = False
         self.open()
+
+    def _register_delivery(self, delivery_tag, consumer_tag=None,
+                           redelivered=False):
+        """Create and track a :class:`DeliveryHandle` for one delivery.
+
+        A tag reused (for example after a channel recovery) represents a
+        new delivery identity: the previous handle is invalidated.
+        """
+        previous = self._deliveries.get(delivery_tag)
+        if previous is not None:
+            previous._invalidate()
+        handle = DeliveryHandle(
+            self, delivery_tag, consumer_tag=consumer_tag,
+        )
+        handle.redelivered = redelivered
+        self._deliveries[delivery_tag] = handle
+        return handle
+
+    def _invalidate_all_deliveries(self):
+        for handle in self._deliveries.values():
+            handle._invalidate()
+        self._deliveries.clear()
+
+    def _settle_delivery(self, handle, outcome, requeue=False):
+        """Apply a one-shot settlement coming from a delivery handle."""
+        delivery_tag = handle.delivery_tag
+        if outcome == 'ack':
+            # Record the acknowledgement, but only send once the
+            # contiguous prefix of outstanding deliveries is complete.
+            return self._flush_acked_prefix()
+
+        # reject/nack always go out as single-delivery frames.
+        self._deliveries.pop(delivery_tag, None)
+        if outcome == 'reject':
+            self.basic_reject(delivery_tag, requeue=requeue)
+        else:
+            self.basic_nack(delivery_tag, multiple=False, requeue=requeue)
+        self._flush_acked_prefix()
+
+    def _flush_acked_prefix(self):
+        """Send one ACK frame for the completed prefix of deliveries.
+
+        Walks outstanding delivery tags in ascending order and stops at
+        the first delivery that is not yet acknowledged, so a frame can
+        never cover a message that is still outstanding.  The acked
+        handles coalesced into the frame are removed from tracking once
+        the frame has been sent.
+        """
+        pending = []
+        for delivery_tag in sorted(self._deliveries):
+            handle = self._deliveries[delivery_tag]
+            if not (handle.settled and handle.settlement == 'ack'):
+                break
+            pending.append(delivery_tag)
+
+        if not pending:
+            return
+
+        last = pending[-1]
+        self.basic_ack(last, multiple=len(pending) > 1)
+        for delivery_tag in pending:
+            del self._deliveries[delivery_tag]
 
     def close(self, reply_code=0, reply_text='', method_sig=(0, 0),
               argsig='BsBB'):
@@ -1408,6 +1483,38 @@ class Channel(AbstractChannel):
             spec.Basic.Ack, argsig, (delivery_tag, multiple),
         )
 
+    def basic_nack(self, delivery_tag, multiple=False, requeue=True,
+                   argsig='Lbb'):
+        """Reject one or more incoming messages (RabbitMQ extension).
+
+        This method allows a client to reject one or more incoming
+        messages.  It can be used to interrupt and cancel large incoming
+        messages, or return untreatable messages to their original
+        queue.
+
+        PARAMETERS:
+            delivery_tag: longlong
+
+                server-assigned delivery tag, behaving as in
+                :meth:`basic_ack`.
+
+            multiple: boolean
+
+                If set to True, the delivery tag is treated as "up to
+                and including", rejecting multiple messages with a
+                single method.
+
+            requeue: boolean
+
+                If this field is False, the message will be discarded.
+                If True, the server will attempt to requeue the
+                message.
+        """
+        return self.send_method(
+            spec.Basic.Nack, argsig,
+            (delivery_tag, multiple, requeue),
+        )
+
     def basic_cancel(self, consumer_tag, nowait=False, argsig='sb'):
         """End a queue consumer.
 
@@ -1449,6 +1556,7 @@ class Channel(AbstractChannel):
         """
         if self.connection is not None:
             self.no_ack_consumers.discard(consumer_tag)
+            self.delivery_handle_consumers.discard(consumer_tag)
             return self.send_method(
                 spec.Basic.Cancel, argsig, (consumer_tag, nowait),
                 wait=None if nowait else spec.Basic.CancelOk,
@@ -1471,12 +1579,13 @@ class Channel(AbstractChannel):
 
     def _remove_tag(self, consumer_tag):
         self.callbacks.pop(consumer_tag, None)
+        self.delivery_handle_consumers.discard(consumer_tag)
         return self.cancel_callbacks.pop(consumer_tag, None)
 
     def basic_consume(self, queue='', consumer_tag='', no_local=False,
                       no_ack=False, exclusive=False, nowait=False,
                       callback=None, arguments=None, on_cancel=None,
-                      argsig='BssbbbbF'):
+                      delivery_handle=False, argsig='BssbbbbF'):
         """Start a queue consumer.
 
         This method asks the server to start a "consumer", which is a
@@ -1570,7 +1679,22 @@ class Channel(AbstractChannel):
                 as the single argument.  If no callable is specified,
                 messages are quietly discarded, no_ack should probably
                 be set to True in that case.
+
+            delivery_handle: boolean
+
+                opt in to tracked delivery handles.  Each delivered
+                message will carry a one-shot
+                :class:`~amqp.delivery.DeliveryHandle` (accessible via
+                ``message.delivery_handle``) supporting ``ack()``,
+                ``reject()`` and ``nack()``.  Acknowledgements of
+                completed messages are coalesced into a single frame.
+                Cannot be combined with ``no_ack``.
         """
+        if no_ack and delivery_handle:
+            raise ValueError(
+                'delivery_handle cannot be enabled for a no_ack consumer'
+            )
+
         p = self.send_method(
             spec.Basic.Consume, argsig,
             (
@@ -1600,6 +1724,8 @@ class Channel(AbstractChannel):
             self.cancel_callbacks[consumer_tag] = on_cancel
         if no_ack:
             self.no_ack_consumers.add(consumer_tag)
+        if delivery_handle:
+            self.delivery_handle_consumers.add(consumer_tag)
 
         if not nowait:
             return consumer_tag
@@ -1609,7 +1735,7 @@ class Channel(AbstractChannel):
     def _on_basic_deliver(self, consumer_tag, delivery_tag, redelivered,
                           exchange, routing_key, msg):
         msg.channel = self
-        msg.delivery_info = {
+        delivery_info = {
             'consumer_tag': consumer_tag,
             'delivery_tag': delivery_tag,
             'redelivered': redelivered,
@@ -1617,9 +1743,22 @@ class Channel(AbstractChannel):
             'routing_key': routing_key,
         }
 
+        handle = None
+        if consumer_tag in self.delivery_handle_consumers:
+            handle = self._register_delivery(
+                delivery_tag, consumer_tag=consumer_tag,
+                redelivered=redelivered,
+            )
+            delivery_info['delivery_handle'] = handle
+        msg.delivery_info = delivery_info
+
         try:
             fun = self.callbacks[consumer_tag]
         except KeyError:
+            if handle is not None:
+                # Nothing will ever settle the registered delivery.
+                self._deliveries.pop(delivery_tag, None)
+                handle._invalidate()
             AMQP_LOGGER.warning(
                 REJECTED_MESSAGE_WITHOUT_CALLBACK,
                 delivery_tag, consumer_tag, exchange, routing_key,
@@ -1628,7 +1767,8 @@ class Channel(AbstractChannel):
         else:
             fun(msg)
 
-    def basic_get(self, queue='', no_ack=False, argsig='Bsb'):
+    def basic_get(self, queue='', no_ack=False, delivery_handle=False,
+                  argsig='Bsb'):
         """Direct access to a queue.
 
         This method provides a direct access to the messages in a
@@ -1665,27 +1805,37 @@ class Channel(AbstractChannel):
         Non-blocking, returns a amqp.basic_message.Message object,
         or None if queue is empty.
         """
+        if no_ack and delivery_handle:
+            raise ValueError(
+                'delivery_handle cannot be enabled for a no_ack get'
+            )
+
         ret = self.send_method(
             spec.Basic.Get, argsig, (0, queue, no_ack),
             wait=[spec.Basic.GetOk, spec.Basic.GetEmpty], returns_tuple=True,
         )
         if not ret or len(ret) < 2:
             return self._on_get_empty(*ret)
-        return self._on_get_ok(*ret)
+        return self._on_get_ok(*ret, delivery_handle=delivery_handle)
 
     def _on_get_empty(self, cluster_id=None):
         pass
 
     def _on_get_ok(self, delivery_tag, redelivered, exchange, routing_key,
-                   message_count, msg):
+                   message_count, msg, delivery_handle=False):
         msg.channel = self
-        msg.delivery_info = {
+        delivery_info = {
             'delivery_tag': delivery_tag,
             'redelivered': redelivered,
             'exchange': exchange,
             'routing_key': routing_key,
             'message_count': message_count
         }
+        if delivery_handle:
+            delivery_info['delivery_handle'] = self._register_delivery(
+                delivery_tag, redelivered=redelivered,
+            )
+        msg.delivery_info = delivery_info
         return msg
 
     def _basic_publish(self, msg, exchange='', routing_key='',

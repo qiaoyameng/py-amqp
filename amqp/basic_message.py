@@ -120,3 +120,10 @@ class Message(GenericContent):
     @property
     def delivery_tag(self):
         return self.delivery_info.get('delivery_tag')
+
+    @property
+    def delivery_handle(self):
+        """The tracked delivery handle, when the consumer opted in."""
+        if self.delivery_info is None:
+            return None
+        return self.delivery_info.get('delivery_handle')

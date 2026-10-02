@@ -374,6 +374,7 @@ class test_Channel:
         self.c.basic_get('q')
         self.c._on_get_ok.assert_called_with(
             'dtag', 'redelivered', 'ex', 'rkey', 'mcount', 'msg',
+            delivery_handle=False,
         )
 
     def test_on_get_empty(self):
