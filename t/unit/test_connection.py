@@ -5,15 +5,33 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 import time
+from struct import pack
 
-from amqp import Connection, spec
+from amqp import Channel, Connection, Message, spec
+from amqp.basic_message import Message as BasicMessage
 from amqp.connection import SSLError
 from amqp.exceptions import (ConnectionError, NotFound,
                              RecoverableConnectionError, ResourceError)
+from amqp.method_framing import frame_handler
 from amqp.sasl import AMQPLAIN, EXTERNAL, GSSAPI, PLAIN, SASL
 from amqp.transport import TCPTransport
 
 from t.mocks import ContextMock
+
+
+class FakeClock:
+
+    def __init__(self):
+        self.now = 0
+
+    def __call__(self):
+        return self.now
+
+
+def method_payload(method_sig, fmt='', args=()):
+    from amqp.serialization import dumps
+
+    return pack('>HH', *method_sig) + dumps(fmt, args)
 
 
 class test_Connection:
@@ -549,6 +567,222 @@ class test_Connection:
     def test_server_capabilities(self):
         self.conn.server_properties['capabilities'] = {'foo': 1}
         assert self.conn.server_capabilities == {'foo': 1}
+
+    def _setup_graceful_close_connection(self):
+        clock = FakeClock()
+        connection = Connection(
+            frame_handler=self.frame_handler,
+            frame_writer=self.frame_writer,
+            authentication=AMQPLAIN('foo', 'bar'),
+        )
+        connection._transport = Mock(name='transport')
+        connection.frame_writer = Mock(name='frame_writer')
+        connection.frame_handler_cls = frame_handler
+        connection.on_inbound_frame = frame_handler(
+            connection, connection.on_inbound_method,
+        )
+        connection._time = clock
+        channel = Channel(connection, 1)
+        channel.is_open = True
+        channel._confirm_selected = True
+        channel._track_pending_publish('exchange', 'routing-key')
+        channel.callbacks['consumer'] = Mock(name='consumer_callback')
+        channel.cancel_callbacks['consumer'] = Mock(
+            name='cancel_callback', side_effect=RuntimeError,
+        )
+        return connection, channel, clock
+
+    def _run_graceful_close_script(self, connection, clock, script):
+        timeouts = []
+
+        def drain_events(timeout=None):
+            timeouts.append(timeout)
+            step = script.pop(0)
+            if isinstance(step, dict) and step.get('group'):
+                frames, advance = step['frames'], step['advance']
+            else:
+                frames, advance = [step], 0
+            for frame in frames:
+                is_timeout = False
+                if isinstance(frame, dict):
+                    frame_type = frame['type']
+                    channel_id = frame['channel']
+                    method_sig = frame.get('method')
+                    payload = frame['payload']
+                    frame_advance = frame['advance']
+                    is_timeout = frame.get('timeout', False)
+                else:
+                    channel_id, method_sig, payload, frame_advance = frame
+                    frame_type = 8 if method_sig == 'heartbeat' else 1
+                    is_timeout = method_sig is None
+
+                if is_timeout:
+                    clock.now += frame_advance
+                    raise socket.timeout
+                connection.on_inbound_frame(
+                    (frame_type, channel_id, payload)
+                )
+                clock.now += frame_advance
+            if isinstance(step, dict) and step.get('group'):
+                return
+
+        connection.drain_events = drain_events
+        return timeouts
+
+    def test_graceful_close_waits_for_ack_and_cancel_with_shared_deadline(self):
+        conn, channel, clock = self._setup_graceful_close_connection()
+        transport = conn._transport
+        script = [
+            (
+                1, spec.Basic.Cancel,
+                method_payload(spec.Basic.Cancel, 's', ('consumer',)), 1,
+            ),
+            (
+                1, spec.Basic.CancelOk,
+                method_payload(spec.Basic.CancelOk, 's', ('consumer',)), 6,
+            ),
+            (
+                1, spec.Basic.Ack,
+                method_payload(spec.Basic.Ack, 'Lb', (1, False)), 7,
+            ),
+            (
+                0, spec.Connection.CloseOk,
+                method_payload(spec.Connection.CloseOk), 0,
+            ),
+        ]
+        timeouts = self._run_graceful_close_script(conn, clock, script)
+
+        result = conn.graceful_close(timeout=20)
+
+        assert result.timed_out is False
+        assert result.pending_publishes == []
+        assert result.pending_consumer_cancels == []
+        assert timeouts == [20, 19, 13, 6]
+        assert [
+            frame_call.args[1:3]
+            for frame_call in conn.frame_writer.call_args_list
+        ] == [
+            (1, spec.Basic.Cancel),
+            (0, spec.Connection.Close),
+        ]
+        transport.close.assert_called_once_with()
+        assert conn.graceful_close(timeout=1) is result
+        assert conn.frame_writer.call_count == 2
+
+    def test_graceful_close_timeout_lists_undetermined_work(self):
+        conn, channel, clock = self._setup_graceful_close_connection()
+        transport = conn._transport
+        pending_publish, = list(channel._pending_publishes.values())
+        script = [
+            (
+                1, spec.Basic.CancelOk,
+                method_payload(spec.Basic.CancelOk, 's', ('consumer',)), 15,
+            ),
+            ('timeout', None, None, 10),
+        ]
+        timeouts = self._run_graceful_close_script(conn, clock, script)
+
+        result = conn.graceful_close(timeout=20)
+
+        assert result.timed_out is True
+        assert result.pending_publishes == [pending_publish]
+        assert result.pending_consumer_cancels == []
+        assert timeouts == [20, 5]
+        assert [
+            frame_call.args[1:3]
+            for frame_call in conn.frame_writer.call_args_list
+        ] == [
+            (1, spec.Basic.Cancel),
+            (0, spec.Connection.Close),
+        ]
+        transport.close.assert_called_once_with()
+
+    def test_graceful_close_rejects_new_work_but_allows_control_frames(self):
+        conn, channel, clock = self._setup_graceful_close_connection()
+        conn.is_graceful_closing = True
+        channel.send_method = Mock(name='send_method')
+
+        with pytest.raises(RecoverableConnectionError):
+            channel.basic_publish(Message('body'))
+        with pytest.raises(RecoverableConnectionError):
+            channel.basic_consume('queue')
+        with pytest.raises(RecoverableConnectionError):
+            channel.basic_get('queue')
+        with pytest.raises(RecoverableConnectionError):
+            conn.channel(2)
+
+        channel.basic_ack(1)
+        channel.send_method.assert_called_with(
+            spec.Basic.Ack, 'Lb', (1, False),
+        )
+        conn.send_heartbeat()
+        conn.frame_writer.assert_called_with(8, 0, None, None, None)
+
+    def test_immediate_close_during_graceful_close_collects_transport(self):
+        conn, channel, clock = self._setup_graceful_close_connection()
+        transport = conn._transport
+        conn.is_graceful_closing = True
+
+        assert conn.close() is None
+
+        transport.close.assert_called_once_with()
+        assert conn._transport is None
+        assert conn.channels is None
+
+    def test_graceful_close_continues_when_user_callback_raises(self):
+        conn, channel, clock = self._setup_graceful_close_connection()
+        transport = conn._transport
+        channel.callbacks['consumer'] = Mock(
+            name='failing_consumer', side_effect=RuntimeError,
+        )
+        channel.cancel_callbacks['consumer'] = Mock(name='cancel_callback')
+        script = [{
+            'group': True,
+            'frames': [
+            (
+                1, spec.Basic.Deliver,
+                method_payload(
+                    spec.Basic.Deliver, 'sLbss',
+                    ('consumer', 2, False, 'exchange', 'routing-key'),
+                ),
+                0,
+            ),
+            {
+                'type': 2,
+                'channel': 1,
+                'method': None,
+                'payload': b''.join((
+                    pack('>HxxQ', BasicMessage.CLASS_ID, 1),
+                    BasicMessage()._serialize_properties(),
+                )),
+                'advance': 0,
+            },
+            {
+                'type': 3,
+                'channel': 1,
+                'method': None,
+                'payload': b'x',
+                'advance': 0,
+            },
+            ],
+            'advance': 0,
+        }, (
+                1, spec.Basic.CancelOk,
+                method_payload(spec.Basic.CancelOk, 's', ('consumer',)), 1,
+            ), (
+                1, spec.Basic.Ack,
+                method_payload(spec.Basic.Ack, 'Lb', (1, False)), 1,
+            ), (
+                0, spec.Connection.CloseOk,
+                method_payload(spec.Connection.CloseOk), 0,
+            )]
+        self._run_graceful_close_script(conn, clock, script)
+
+        result = conn.graceful_close(timeout=20)
+
+        assert result.timed_out is False
+        transport.close.assert_called_once_with()
+        assert conn._transport is None
 
     @pytest.mark.parametrize(
         'conn_kwargs,expected_vhost', [

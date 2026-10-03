@@ -20,6 +20,7 @@ class test_Channel:
     def setup_conn(self):
         self.conn = MagicMock(name='connection')
         self.conn.is_closing = False
+        self.conn.is_graceful_closing = False
         self.conn.channels = {}
         self.conn._get_free_channel_id.return_value = 2
         self.c = Channel(self.conn, 1)
@@ -606,12 +607,17 @@ class test_Channel:
 
     def test_on_basic_ack(self):
         callback = Mock(name='callback')
+        delivery_tag = self.c._track_pending_publish('exchange', 'routing-key')
         self.c.events['basic_ack'].add(callback)
         self.c._on_basic_ack(123, True)
+        assert not self.c._pending_publishes
         callback.assert_called_with(123, True)
+        assert delivery_tag == 1
 
     def test_on_basic_nack(self):
         callback = Mock(name='callback')
+        self.c._track_pending_publish('exchange', 'routing-key')
         self.c.events['basic_nack'].add(callback)
         self.c._on_basic_nack(123, True)
+        assert not self.c._pending_publishes
         callback.assert_called_with(123, True)

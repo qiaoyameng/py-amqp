@@ -11,8 +11,8 @@ from vine import ensure_promise
 from . import spec
 from .abstract_channel import AbstractChannel
 from .exceptions import (ChannelError, ConsumerCancelled, MessageNacked,
-                         RecoverableConnectionError,
-                         error_for_code)
+                         RecoverableConnectionError, error_for_code)
+from .graceful import PendingConsumerCancel, PendingPublish
 from .protocol import queue_declare_ok_t
 
 __all__ = ('Channel',)
@@ -113,6 +113,9 @@ class Channel(AbstractChannel):
         self.auto_decode = auto_decode
         self.events = defaultdict(set)
         self.no_ack_consumers = set()
+        self._pending_publishes = {}
+        self._pending_consumer_cancels = {}
+        self._next_publish_delivery_tag = 1
 
         self.on_open = ensure_promise(on_open)
 
@@ -171,6 +174,8 @@ class Channel(AbstractChannel):
         self.cancel_callbacks.clear()
         self.events.clear()
         self.no_ack_consumers.clear()
+        self._pending_publishes.clear()
+        self._pending_consumer_cancels.clear()
 
     def _do_revive(self):
         self.is_open = False
@@ -1447,12 +1452,66 @@ class Channel(AbstractChannel):
                 server could not complete the method it will raise a
                 channel or connection exception.
         """
-        if self.connection is not None:
-            self.no_ack_consumers.discard(consumer_tag)
+        if self.connection is None:
+            return
+
+        self.no_ack_consumers.discard(consumer_tag)
+        if not nowait:
+            self._pending_consumer_cancels[consumer_tag] = (
+                PendingConsumerCancel(self.channel_id, consumer_tag)
+            )
+
+        try:
             return self.send_method(
                 spec.Basic.Cancel, argsig, (consumer_tag, nowait),
                 wait=None if nowait else spec.Basic.CancelOk,
             )
+        except Exception:
+            self._pending_consumer_cancels.pop(consumer_tag, None)
+            raise
+
+    def _begin_graceful_close(self):
+        if self.connection is None or not self.is_open:
+            return
+
+        for consumer_tag in list(self.callbacks):
+            if consumer_tag in self._pending_consumer_cancels:
+                continue
+            self._pending_consumer_cancels[consumer_tag] = (
+                PendingConsumerCancel(self.channel_id, consumer_tag)
+            )
+            self.no_ack_consumers.discard(consumer_tag)
+            try:
+                self.send_method(
+                    spec.Basic.Cancel, 'sb', (consumer_tag, False),
+                )
+            except Exception:
+                self._pending_consumer_cancels.pop(consumer_tag, None)
+                raise
+
+    def _reject_during_graceful_close(self, operation):
+        if self.connection and self.connection.is_graceful_closing:
+            raise RecoverableConnectionError(
+                f'{operation} is not allowed while the connection is '
+                f'gracefully closing.'
+            )
+
+    def _track_pending_publish(self, exchange, routing_key):
+        delivery_tag = self._next_publish_delivery_tag
+        self._next_publish_delivery_tag += 1
+        pending = PendingPublish(
+            self.channel_id, delivery_tag, exchange, routing_key,
+        )
+        self._pending_publishes[delivery_tag] = pending
+        return delivery_tag
+
+    def _resolve_pending_publish(self, delivery_tag, multiple=False):
+        if multiple:
+            for tag in list(self._pending_publishes):
+                if tag <= delivery_tag:
+                    self._pending_publishes.pop(tag, None)
+        else:
+            self._pending_publishes.pop(delivery_tag, None)
 
     def _on_basic_cancel(self, consumer_tag):
         """Consumer cancelled by server.
@@ -1467,6 +1526,7 @@ class Channel(AbstractChannel):
             raise ConsumerCancelled(consumer_tag, spec.Basic.Cancel)
 
     def _on_basic_cancel_ok(self, consumer_tag):
+        self._pending_consumer_cancels.pop(consumer_tag, None)
         self._remove_tag(consumer_tag)
 
     def _remove_tag(self, consumer_tag):
@@ -1571,6 +1631,7 @@ class Channel(AbstractChannel):
                 messages are quietly discarded, no_ack should probably
                 be set to True in that case.
         """
+        self._reject_during_graceful_close('basic_consume')
         p = self.send_method(
             spec.Basic.Consume, argsig,
             (
@@ -1665,6 +1726,7 @@ class Channel(AbstractChannel):
         Non-blocking, returns a amqp.basic_message.Message object,
         or None if queue is empty.
         """
+        self._reject_during_graceful_close('basic_get')
         ret = self.send_method(
             spec.Basic.Get, argsig, (0, queue, no_ack),
             wait=[spec.Basic.GetOk, spec.Basic.GetEmpty], returns_tuple=True,
@@ -1782,6 +1844,7 @@ class Channel(AbstractChannel):
         if not self.connection:
             raise RecoverableConnectionError(
                 'basic_publish: connection closed')
+        self._reject_during_graceful_close('basic_publish')
 
         capabilities = self.connection. \
             client_properties.get('capabilities', {})
@@ -1794,7 +1857,7 @@ class Channel(AbstractChannel):
 
         try:
             with self.connection.transport.having_timeout(timeout):
-                return self.send_method(
+                ret = self.send_method(
                     spec.Basic.Publish, argsig,
                     (0, exchange, routing_key, mandatory, immediate), msg
                 )
@@ -1803,10 +1866,14 @@ class Channel(AbstractChannel):
             # not trigger Kombu/ensure() reconnects, so this must be a
             # connection error. See celery/py-amqp#452.
             raise RecoverableConnectionError('basic_publish: timed out')
+        if self._confirm_selected:
+            self._track_pending_publish(exchange, routing_key)
+        return ret
 
     basic_publish = _basic_publish
 
     def basic_publish_confirm(self, *args, **kwargs):
+        self._reject_during_graceful_close('basic_publish')
         confirm_timeout = kwargs.pop('confirm_timeout', None)
 
         def confirm_handler(method, *args):
@@ -2116,15 +2183,18 @@ class Channel(AbstractChannel):
             server could not complete the method it will raise a channel
             or connection exception.
         """
+        self._reject_during_graceful_close('confirm_select')
         return self.send_method(
             spec.Confirm.Select, 'b', (nowait,),
             wait=None if nowait else spec.Confirm.SelectOk,
         )
 
     def _on_basic_ack(self, delivery_tag, multiple):
+        self._resolve_pending_publish(delivery_tag, multiple)
         for callback in self.events['basic_ack']:
             callback(delivery_tag, multiple)
 
     def _on_basic_nack(self, delivery_tag, multiple):
+        self._resolve_pending_publish(delivery_tag, multiple)
         for callback in self.events['basic_nack']:
             callback(delivery_tag, multiple)

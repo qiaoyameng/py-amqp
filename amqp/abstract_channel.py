@@ -156,7 +156,15 @@ class AbstractChannel:
             args.append(content)
 
         for listener in listeners:
-            listener(*args)
+            try:
+                listener(*args)
+            except Exception:
+                if not getattr(self.connection, 'is_graceful_closing', False):
+                    raise
+                AMQP_LOGGER.exception(
+                    'Exception in callback during graceful close for '
+                    'channel %s', self.channel_id,
+                )
 
         if one_shot:
             one_shot(method_sig, *args)

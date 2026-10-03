@@ -39,6 +39,8 @@ from .exceptions import (AccessRefused, AMQPError,  # noqa
                          NotFound, PreconditionFailed, RecoverableChannelError,
                          RecoverableConnectionError, ResourceError,
                          ResourceLocked, UnexpectedFrame, error_for_code)
+from .graceful import (GracefulCloseResult, PendingConsumerCancel,  # noqa
+                       PendingPublish)
 from .utils import promise  # noqa
 
 __all__ = (
@@ -72,4 +74,7 @@ __all__ = (
     'AMQPNotImplementedError',
     'InternalError',
     'error_for_code',
+    'GracefulCloseResult',
+    'PendingConsumerCancel',
+    'PendingPublish',
 )

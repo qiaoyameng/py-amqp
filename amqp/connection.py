@@ -3,6 +3,7 @@
 
 import logging
 import socket
+import threading
 import uuid
 import warnings
 from array import array
@@ -17,6 +18,7 @@ from .exceptions import (AMQPDeprecationWarning, ChannelError, ConnectionError,
                          ConnectionForced, MessageNacked, RecoverableChannelError,
                          RecoverableConnectionError, ResourceError,
                          error_for_code)
+from .graceful import GracefulCloseResult
 from .method_framing import frame_handler, frame_writer
 from .transport import Transport
 
@@ -251,6 +253,13 @@ class Connection(AbstractChannel):
         self._frame_writer = None
         self._on_inbound_frame = None
         self._transport = None
+        self.is_graceful_closing = False
+        self._graceful_close_lock = threading.RLock()
+        self._graceful_close_in_progress = False
+        self._graceful_close_result = None
+        self._graceful_close_done = threading.Event()
+        self._graceful_close_done.set()
+        self._time = monotonic
 
         # Properties set in the Tune method
         self.channel_max = channel_max
@@ -482,6 +491,149 @@ class Connection(AbstractChannel):
                 ch.collect()
         self._transport = self.connection = self.channels = None
 
+    def _graceful_channels(self):
+        if not self.channels:
+            return []
+        return [
+            channel for channel_id, channel in sorted(self.channels.items())
+            if channel_id != 0 and getattr(channel, 'is_open', False)
+        ]
+
+    def _graceful_pending_publishes(self):
+        pending = []
+        for channel in self._graceful_channels():
+            pending.extend(channel._pending_publishes.values())
+        return sorted(
+            pending,
+            key=lambda item: (item.channel_id, item.delivery_tag),
+        )
+
+    def _graceful_pending_consumer_cancels(self):
+        pending = []
+        for channel in self._graceful_channels():
+            pending.extend(channel._pending_consumer_cancels.values())
+        return sorted(
+            pending,
+            key=lambda item: (item.channel_id, item.consumer_tag),
+        )
+
+    def _graceful_close_result_now(self, timed_out=False):
+        return GracefulCloseResult(
+            timed_out,
+            self._graceful_pending_publishes(),
+            self._graceful_pending_consumer_cancels(),
+        )
+
+    def _remaining_time(self, deadline):
+        if deadline is None:
+            return None
+        return deadline - self._time()
+
+    def _drain_graceful_until(self, ready, deadline):
+        while self._transport is not None:
+            if ready():
+                return
+
+            remaining = self._remaining_time(deadline)
+            if remaining <= 0:
+                raise socket.timeout('graceful close deadline exceeded')
+
+            try:
+                self.heartbeat_tick()
+                self.drain_events(timeout=remaining)
+            except socket.timeout:
+                if self._transport is None or ready():
+                    return
+                if self._remaining_time(deadline) <= 0:
+                    raise
+
+    def _do_graceful_close(self, timeout=None):
+        deadline = None
+        if timeout is not None:
+            deadline = self._time() + timeout
+
+        self.is_graceful_closing = True
+        for channel in self._graceful_channels():
+            channel._begin_graceful_close()
+
+        timed_out = False
+        pending_publishes = []
+        pending_consumer_cancels = []
+        try:
+            self._drain_graceful_until(
+                lambda: (
+                    not self._graceful_pending_publishes()
+                    and not self._graceful_pending_consumer_cancels()
+                ),
+                deadline,
+            )
+        except (OSError, SSLError):
+            timed_out = True
+        finally:
+            pending_publishes = self._graceful_pending_publishes()
+            pending_consumer_cancels = (
+                self._graceful_pending_consumer_cancels()
+            )
+
+        if self._transport is not None:
+            self.is_closing = True
+            try:
+                try:
+                    self.send_method(
+                        spec.Connection.Close, 'BsBB', (0, '', 0, 0),
+                    )
+                    if not timed_out:
+                        self._drain_graceful_until(
+                            lambda: self._transport is None,
+                            deadline,
+                        )
+                except (OSError, SSLError, socket.timeout):
+                    timed_out = True
+            finally:
+                self.is_closing = False
+
+        if self._transport is not None:
+            self.collect()
+
+        return GracefulCloseResult(
+            timed_out, pending_publishes, pending_consumer_cancels,
+        )
+
+    def graceful_close(self, timeout=None):
+        """Stop accepting work and close after pending work settles."""
+        with self._graceful_close_lock:
+            existing = self._graceful_close_result
+            if existing is not None:
+                return existing
+
+            if self._transport is None:
+                result = self._graceful_close_result_now()
+                self._graceful_close_result = result
+                return result
+
+            if self._graceful_close_in_progress:
+                self._graceful_close_done.wait()
+                return self._graceful_close_result
+
+            self._graceful_close_in_progress = True
+            self._graceful_close_done.clear()
+
+        result = None
+        try:
+            try:
+                result = self._do_graceful_close(timeout)
+            except (OSError, SSLError):
+                self.collect()
+                result = GracefulCloseResult(True, [], [])
+            return result
+        finally:
+            with self._graceful_close_lock:
+                if result is None:
+                    result = GracefulCloseResult(False, [], [])
+                self._graceful_close_result = result
+                self._graceful_close_in_progress = False
+                self._graceful_close_done.set()
+
     def _get_free_channel_id(self):
         # Cast to a set for fast lookups, and keep stored as an array for lower memory usage.
         used_channel_ids = set(self._used_channel_ids)
@@ -510,6 +662,9 @@ class Connection(AbstractChannel):
         """
         if self.channels is None:
             raise RecoverableConnectionError('Connection already closed.')
+        if self.is_graceful_closing:
+            raise RecoverableConnectionError(
+                'Connection is gracefully closing.')
 
         try:
             return self.channels[channel_id]
@@ -595,6 +750,9 @@ class Connection(AbstractChannel):
         """
         if self._transport is None:
             # already closed
+            return
+        if self.is_graceful_closing:
+            self.collect()
             return
 
         try:
@@ -740,11 +898,11 @@ class Connection(AbstractChannel):
         sent_now = self.bytes_sent
         recv_now = self.bytes_recv
         if self.prev_sent is None or self.prev_sent != sent_now:
-            self.last_heartbeat_sent = monotonic()
+            self.last_heartbeat_sent = self._time()
         if self.prev_recv is None or self.prev_recv != recv_now:
-            self.last_heartbeat_received = monotonic()
+            self.last_heartbeat_received = self._time()
 
-        now = monotonic()
+        now = self._time()
         AMQP_HEARTBEAT_LOGGER.debug(
             'heartbeat_tick : Prev sent/recv: %s/%s, '
             'now - %s/%s, monotonic - %s, '
@@ -765,13 +923,13 @@ class Connection(AbstractChannel):
                 'heartbeat_tick: sending heartbeat for connection %s',
                 self._connection_id)
             self.send_heartbeat()
-            self.last_heartbeat_sent = monotonic()
+            self.last_heartbeat_sent = self._time()
 
         # if we've missed two intervals' heartbeats, fail; this gives the
         # server enough time to send heartbeats a little late
         two_heartbeats = 2 * self.heartbeat
         two_heartbeats_interval = self.last_heartbeat_received + two_heartbeats
-        heartbeats_missed = two_heartbeats_interval < monotonic()
+        heartbeats_missed = two_heartbeats_interval < self._time()
         if self.last_heartbeat_received and heartbeats_missed:
             raise ConnectionForced('Too many heartbeats missed')
 
