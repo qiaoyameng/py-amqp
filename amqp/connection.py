@@ -3,12 +3,13 @@
 
 import logging
 import socket
+import threading
 import uuid
 import warnings
 from array import array
 from time import monotonic
 
-from vine import ensure_promise
+from vine import ensure_promise, promise
 
 from . import __version__, sasl, spec
 from .abstract_channel import AbstractChannel
@@ -18,6 +19,7 @@ from .exceptions import (AMQPDeprecationWarning, ChannelError, ConnectionError,
                          RecoverableConnectionError, ResourceError,
                          error_for_code)
 from .method_framing import frame_handler, frame_writer
+from .shutdown import GracefulCloseResult
 from .transport import Transport
 
 try:
@@ -58,7 +60,6 @@ NEGOTIATE_CAPABILITIES = {
     'connection.blocked': True,
     'authentication_failure_close': True,
 }
-
 
 class Connection(AbstractChannel):
     """AMQP Connection.
@@ -167,7 +168,10 @@ class Connection(AbstractChannel):
     _METHODS = {m.method_sig: m for m in _METHODS}
 
     _ALLOWED_METHODS_WHEN_CLOSING = (
-        spec.Connection.Close, spec.Connection.CloseOk
+        spec.Connection.Close, spec.Connection.CloseOk,
+        spec.Channel.Close, spec.Channel.CloseOk,
+        spec.Basic.Ack, spec.Basic.Nack, spec.Basic.Cancel,
+        spec.Basic.CancelOk, spec.Basic.Deliver, spec.Basic.Return,
     )
 
     connection_errors = (
@@ -251,6 +255,12 @@ class Connection(AbstractChannel):
         self._frame_writer = None
         self._on_inbound_frame = None
         self._transport = None
+        self._graceful_close_lock = threading.RLock()
+        self._graceful_close_result = None
+        self._graceful_close_event = threading.Event()
+        self._graceful_close_owner = None
+        self._graceful_close_errors = []
+        self._graceful_close_active = False
 
         # Properties set in the Tune method
         self.channel_max = channel_max
@@ -466,7 +476,114 @@ class Connection(AbstractChannel):
     def connected(self):
         return self._transport and self._transport.connected
 
+    @property
+    def is_gracefully_closing(self):
+        return self._graceful_close_result is not None
+
+    def _remaining_time(self, deadline):
+        if deadline is None:
+            return None
+        return max(0.0, deadline - monotonic())
+
+    def _deadline_expired(self, deadline):
+        if deadline is None:
+            return False
+        return self._remaining_time(deadline) <= 0
+
+    def _read_one_frame(self, timeout):
+        return self.blocking_read(timeout)
+
+    def _drain_graceful_pending(self, deadline, is_pending):
+        while not is_pending():
+            timeout = self._remaining_time(deadline)
+            if timeout is not None and timeout <= 0:
+                return False
+            try:
+                self._read_one_frame(timeout)
+            except socket.timeout:
+                return False
+            except (OSError, SSLError) as exc:
+                self._graceful_close_errors.append(exc)
+                return False
+            except Exception as exc:
+                self._graceful_close_errors.append(exc)
+        return True
+
+    def _graceful_pending(self):
+        if self.channels is None:
+            return True
+        for channel in self.channels.values():
+            if channel is self:
+                continue
+            if channel._graceful_pending():
+                return False
+        return True
+
+    def _graceful_channels_open(self):
+        if self.channels is None:
+            return False
+        return any(
+            channel.is_open
+            for channel in self.channels.values()
+            if channel is not self
+        )
+
+    def _graceful_snapshot(self, timed_out):
+        publishes = []
+        consumers = []
+        if self.channels:
+            for channel in self.channels.values():
+                if channel is self:
+                    continue
+                publishes.extend(channel._unconfirmed_publishes())
+                consumers.extend(channel._uncancelled_consumers())
+
+        result = self._graceful_close_result or GracefulCloseResult()
+        result.timed_out = timed_out
+        result.unconfirmed_publishes = tuple(publishes)
+        result.uncancelled_consumers = tuple(consumers)
+        result.errors = tuple(self._graceful_close_errors)
+        self._graceful_close_result = result
+        self._graceful_close_event.set()
+        return result
+
+    def _send_connection_close(self, reply_code, reply_text, method_sig,
+                               argsig, deadline=None):
+        if self._transport is None:
+            return True
+
+        self.is_closing = True
+        close_promise = promise()
+        previous_close_promise = self._pending.get(spec.Connection.CloseOk)
+        self._pending[spec.Connection.CloseOk] = close_promise
+        try:
+            self.send_method(
+                spec.Connection.Close, argsig,
+                (reply_code, reply_text, method_sig[0], method_sig[1]),
+            )
+            if self._deadline_expired(deadline):
+                return False
+            timeout = self._remaining_time(deadline)
+            while not close_promise.ready:
+                self.blocking_read(timeout)
+                timeout = self._remaining_time(deadline)
+                if timeout is not None and timeout <= 0:
+                    return False
+            return True
+        except (OSError, SSLError) as exc:
+            self._graceful_close_errors.append(exc)
+            return False
+        except Exception as exc:
+            self._graceful_close_errors.append(exc)
+            return False
+        finally:
+            if previous_close_promise is not None:
+                self._pending[spec.Connection.CloseOk] = previous_close_promise
+            else:
+                self._pending.pop(spec.Connection.CloseOk, None)
+
     def collect(self):
+        self.is_closing = False
         if self._transport:
             self._transport.close()
 
@@ -510,6 +627,8 @@ class Connection(AbstractChannel):
         """
         if self.channels is None:
             raise RecoverableConnectionError('Connection already closed.')
+        if self.is_gracefully_closing and channel_id not in self.channels:
+            raise RecoverableConnectionError('Connection already closing.')
 
         try:
             return self.channels[channel_id]
@@ -538,6 +657,83 @@ class Connection(AbstractChannel):
         return self.channels[channel_id].dispatch_method(
             method_sig, payload, content,
         )
+
+    def graceful_close(self, timeout=30, reply_code=0, reply_text='',
+                       method_sig=(0, 0), argsig='BsBB'):
+        """Close gracefully, returning work still unresolved at the deadline.
+
+        New publishes and consumers are rejected immediately. Existing
+        consumers are cancelled and publisher confirms are drained under one
+        deadline shared by every channel. Timeout does not mark unresolved
+        work successful and does not resend it.
+        """
+        with self._graceful_close_lock:
+            existing_result = self._graceful_close_result
+            if existing_result is None:
+                self._graceful_close_result = GracefulCloseResult()
+                if self._transport is not None:
+                    self._graceful_close_active = True
+                    self._graceful_close_owner = threading.get_ident()
+            current_owner = self._graceful_close_owner
+
+        if existing_result is not None:
+            if current_owner != threading.get_ident():
+                self._graceful_close_event.wait()
+            return existing_result
+
+        if self._transport is None:
+            self._graceful_close_event.set()
+            return self._graceful_close_result
+
+        deadline = monotonic() + timeout if timeout is not None else None
+        result = None
+        self._graceful_close_active = True
+        try:
+            self.is_closing = True
+            channels = [
+                channel for channel in self.channels.values()
+                if channel is not self
+            ]
+
+            for channel in channels:
+                channel._begin_graceful_cancel()
+
+            timed_out = self._deadline_expired(deadline)
+            if not timed_out:
+                timed_out = not self._drain_graceful_pending(
+                    deadline, self._graceful_pending,
+                )
+
+            for channel in channels:
+                channel._send_graceful_close()
+
+            if not timed_out:
+                timed_out = not self._drain_graceful_pending(
+                    deadline, lambda: not self._graceful_channels_open(),
+                )
+
+            connection_closed = self._send_connection_close(
+                reply_code, reply_text, method_sig, argsig, deadline,
+            )
+            if not timed_out:
+                timed_out = not connection_closed
+
+            result = self._graceful_snapshot(timed_out)
+            return result
+        except Exception as exc:
+            self._graceful_close_errors.append(exc)
+            result = self._graceful_snapshot(True)
+        finally:
+            with self._graceful_close_lock:
+                self._graceful_close_owner = None
+                self._graceful_close_active = False
+            if result is None:
+                result = self._graceful_snapshot(True)
+            self._graceful_close_event.set()
+            self.collect()
+        return result
+
+    close_gracefully = graceful_close
 
     def close(self, reply_code=0, reply_text='', method_sig=(0, 0),
               argsig='BsBB'):
@@ -596,6 +792,11 @@ class Connection(AbstractChannel):
         if self._transport is None:
             # already closed
             return
+        if self._graceful_close_active:
+            if self._graceful_close_owner == threading.get_ident():
+                return self._graceful_close_result
+            self._graceful_close_event.wait()
+            return self._graceful_close_result
 
         try:
             self.is_closing = True

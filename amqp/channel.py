@@ -14,6 +14,7 @@ from .exceptions import (ChannelError, ConsumerCancelled, MessageNacked,
                          RecoverableConnectionError,
                          error_for_code)
 from .protocol import queue_declare_ok_t
+from .shutdown import PendingConsumerCancellation, PendingPublish
 
 __all__ = ('Channel',)
 
@@ -91,7 +92,9 @@ class Channel(AbstractChannel):
     _METHODS = {m.method_sig: m for m in _METHODS}
 
     _ALLOWED_METHODS_WHEN_CLOSING = (
-        spec.Channel.Close, spec.Channel.CloseOk
+        spec.Channel.Close, spec.Channel.CloseOk,
+        spec.Basic.Ack, spec.Basic.Nack, spec.Basic.Cancel,
+        spec.Basic.CancelOk, spec.Basic.Deliver, spec.Basic.Return,
     )
 
     def __init__(self, connection,
@@ -119,6 +122,9 @@ class Channel(AbstractChannel):
         # set first time basic_publish_confirm is called
         # and publisher confirms are enabled for this channel.
         self._confirm_selected = False
+        self._next_publish_tag = 0
+        self._unconfirmed_publish_map = {}
+        self._pending_cancellations = set()
         if self.connection.confirm_publish:
             self.basic_publish = self.basic_publish_confirm
 
@@ -132,7 +138,75 @@ class Channel(AbstractChannel):
         "no_ack_consumers",
         "on_open",
         "_confirm_selected",
+        "_next_publish_tag",
+        "_unconfirmed_publish_map",
+        "_pending_cancellations",
         )
+
+    def _is_gracefully_closing(self):
+        connection = self.connection
+        return getattr(connection, 'is_gracefully_closing', False) is True
+
+    def _raise_if_gracefully_closing(self, operation):
+        if self._is_gracefully_closing():
+            raise RecoverableConnectionError(
+                f'{operation} not allowed while connection is closing'
+            )
+
+    def _record_close_callback_error(self, exc):
+        connection = self.connection
+        errors = getattr(connection, '_graceful_close_errors', None)
+        if errors is not None:
+            errors.append(exc)
+        else:
+            raise
+
+    def _run_close_callback(self, callback, *args):
+        try:
+            return callback(*args)
+        except Exception as exc:
+            self._record_close_callback_error(exc)
+
+    def _begin_graceful_cancel(self):
+        if not self.is_open or self.connection is None:
+            return
+
+        for consumer_tag in list(self.callbacks):
+            self._pending_cancellations.add(consumer_tag)
+            self.no_ack_consumers.discard(consumer_tag)
+            try:
+                self.send_method(
+                    spec.Basic.Cancel, 'sb', (consumer_tag, False),
+                )
+            except Exception as exc:
+                self._pending_cancellations.add(consumer_tag)
+                self._record_close_callback_error(exc)
+
+    def _send_graceful_close(self):
+        if not self.is_open or self.connection is None:
+            return
+
+        try:
+            self.is_closing = True
+            self.send_method(
+                spec.Channel.Close, 'BsBB', (0, '', 0, 0),
+            )
+        except Exception as exc:
+            self._record_close_callback_error(exc)
+
+    def _graceful_pending(self):
+        return bool(
+            self._unconfirmed_publish_map or self._pending_cancellations
+        )
+
+    def _unconfirmed_publishes(self):
+        return list(self._unconfirmed_publish_map.values())
+
+    def _uncancelled_consumers(self):
+        return [
+            PendingConsumerCancellation(self.channel_id, consumer_tag)
+            for consumer_tag in self._pending_cancellations
+        ]
 
     def then(self, on_success, on_error=None):
         return self.on_open.then(on_success, on_error)
@@ -158,6 +232,7 @@ class Channel(AbstractChannel):
         """
         AMQP_LOGGER.debug('Closed channel #%s', self.channel_id)
         self.is_open = False
+        self.is_closing = False
         channel_id, self.channel_id = self.channel_id, None
         connection, self.connection = self.connection, None
         if connection:
@@ -171,6 +246,8 @@ class Channel(AbstractChannel):
         self.cancel_callbacks.clear()
         self.events.clear()
         self.no_ack_consumers.clear()
+        self._unconfirmed_publish_map.clear()
+        self._pending_cancellations.clear()
 
     def _do_revive(self):
         self.is_open = False
@@ -444,6 +521,7 @@ class Channel(AbstractChannel):
         """
         if self.is_open:
             return
+        self._raise_if_gracefully_closing('channel.open')
 
         return self.send_method(
             spec.Channel.Open, 's', ('',), wait=spec.Channel.OpenOk,
@@ -1449,10 +1527,16 @@ class Channel(AbstractChannel):
         """
         if self.connection is not None:
             self.no_ack_consumers.discard(consumer_tag)
-            return self.send_method(
-                spec.Basic.Cancel, argsig, (consumer_tag, nowait),
-                wait=None if nowait else spec.Basic.CancelOk,
-            )
+            if not nowait:
+                self._pending_cancellations.add(consumer_tag)
+            try:
+                return self.send_method(
+                    spec.Basic.Cancel, argsig, (consumer_tag, nowait),
+                    wait=None if nowait else spec.Basic.CancelOk,
+                )
+            except Exception:
+                self._pending_cancellations.discard(consumer_tag)
+                raise
 
     def _on_basic_cancel(self, consumer_tag):
         """Consumer cancelled by server.
@@ -1461,12 +1545,22 @@ class Channel(AbstractChannel):
 
         """
         callback = self._remove_tag(consumer_tag)
+        self._pending_cancellations.discard(consumer_tag)
         if callback:
-            callback(consumer_tag)
+            if self._is_gracefully_closing():
+                self._run_close_callback(callback, consumer_tag)
+            else:
+                callback(consumer_tag)
+        elif self._is_gracefully_closing():
+            return
         else:
             raise ConsumerCancelled(consumer_tag, spec.Basic.Cancel)
 
     def _on_basic_cancel_ok(self, consumer_tag):
+        callback = self.cancel_callbacks.get(consumer_tag)
+        if callback and self._is_gracefully_closing():
+            self._run_close_callback(callback, consumer_tag)
+        self._pending_cancellations.discard(consumer_tag)
         self._remove_tag(consumer_tag)
 
     def _remove_tag(self, consumer_tag):
@@ -1571,6 +1665,8 @@ class Channel(AbstractChannel):
                 messages are quietly discarded, no_ack should probably
                 be set to True in that case.
         """
+        self._raise_if_gracefully_closing('basic_consume')
+
         p = self.send_method(
             spec.Basic.Consume, argsig,
             (
@@ -1626,7 +1722,10 @@ class Channel(AbstractChannel):
             )
             self.basic_reject(delivery_tag, requeue=True)
         else:
-            fun(msg)
+            if self._is_gracefully_closing():
+                self._run_close_callback(fun, msg)
+            else:
+                fun(msg)
 
     def basic_get(self, queue='', no_ack=False, argsig='Bsb'):
         """Direct access to a queue.
@@ -1665,6 +1764,8 @@ class Channel(AbstractChannel):
         Non-blocking, returns a amqp.basic_message.Message object,
         or None if queue is empty.
         """
+        self._raise_if_gracefully_closing('basic_get')
+
         ret = self.send_method(
             spec.Basic.Get, argsig, (0, queue, no_ack),
             wait=[spec.Basic.GetOk, spec.Basic.GetEmpty], returns_tuple=True,
@@ -1782,6 +1883,7 @@ class Channel(AbstractChannel):
         if not self.connection:
             raise RecoverableConnectionError(
                 'basic_publish: connection closed')
+        self._raise_if_gracefully_closing('basic_publish')
 
         capabilities = self.connection. \
             client_properties.get('capabilities', {})
@@ -1792,17 +1894,35 @@ class Channel(AbstractChannel):
             except socket.timeout:
                 pass
 
+        pending_publish = None
+        if self._confirm_selected:
+            self._next_publish_tag += 1
+            pending_publish = PendingPublish(
+                self.channel_id, self._next_publish_tag,
+                exchange, routing_key,
+            )
+            self._unconfirmed_publish_map[self._next_publish_tag] = (
+                pending_publish
+            )
+
         try:
             with self.connection.transport.having_timeout(timeout):
-                return self.send_method(
+                result = self.send_method(
                     spec.Basic.Publish, argsig,
                     (0, exchange, routing_key, mandatory, immediate), msg
                 )
+            return result
         except (socket.timeout, TimeoutError):
             # A write timeout means the socket is dead. Channel errors do
             # not trigger Kombu/ensure() reconnects, so this must be a
             # connection error. See celery/py-amqp#452.
             raise RecoverableConnectionError('basic_publish: timed out')
+        except Exception:
+            if pending_publish is not None:
+                self._unconfirmed_publish_map.pop(
+                    pending_publish.delivery_tag, None,
+                )
+            raise
 
     basic_publish = _basic_publish
 
@@ -2116,15 +2236,55 @@ class Channel(AbstractChannel):
             server could not complete the method it will raise a channel
             or connection exception.
         """
-        return self.send_method(
+        result = self.send_method(
             spec.Confirm.Select, 'b', (nowait,),
             wait=None if nowait else spec.Confirm.SelectOk,
         )
+        self._confirm_selected = True
+        self._next_publish_tag = 0
+        self._unconfirmed_publish_map.clear()
+        return result
 
     def _on_basic_ack(self, delivery_tag, multiple):
+        self._resolve_publisher_confirm(delivery_tag, multiple)
         for callback in self.events['basic_ack']:
-            callback(delivery_tag, multiple)
+            if self._is_gracefully_closing():
+                self._run_close_callback(
+                    callback, delivery_tag, multiple,
+                )
+            else:
+                callback(delivery_tag, multiple)
 
     def _on_basic_nack(self, delivery_tag, multiple):
+        if multiple:
+            was_pending = any(
+                tag <= delivery_tag
+                for tag in self._unconfirmed_publish_map
+            )
+        else:
+            was_pending = delivery_tag in self._unconfirmed_publish_map
+        self._resolve_publisher_confirm(delivery_tag, multiple)
+        if (
+            was_pending and self._is_gracefully_closing()
+            and spec.Basic.Nack not in self._pending
+        ):
+            self._record_close_callback_error(
+                MessageNacked(
+                    f'Publish {delivery_tag} nacked during graceful close'
+                )
+            )
         for callback in self.events['basic_nack']:
-            callback(delivery_tag, multiple)
+            if self._is_gracefully_closing():
+                self._run_close_callback(
+                    callback, delivery_tag, multiple,
+                )
+            else:
+                callback(delivery_tag, multiple)
+
+    def _resolve_publisher_confirm(self, delivery_tag, multiple=False):
+        if multiple:
+            for tag in list(self._unconfirmed_publish_map):
+                if tag <= delivery_tag:
+                    self._unconfirmed_publish_map.pop(tag, None)
+        else:
+            self._unconfirmed_publish_map.pop(delivery_tag, None)
